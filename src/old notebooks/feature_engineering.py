@@ -457,9 +457,8 @@ def assemble_feature_matrix(monthly_df, drop_lags_na=True):
     df = monthly_df.copy()
 
     # Define feature sets for different model specifications
-    # These must align with get_feature_specs() in modeling.py
     feature_sets = {
-        "spec_A_grouped_channels": {
+        "model_A_grouped": {
             "target": "log_total_gmv",
             "features": [
                 "log_spend_traditional",
@@ -468,7 +467,7 @@ def assemble_feature_matrix(monthly_df, drop_lags_na=True):
             ],
             "description": "Grouped channels (traditional + digital_performance) + sale flag"
         },
-        "spec_B_total_spend": {
+        "model_B_total": {
             "target": "log_total_gmv",
             "features": [
                 "log_Total_Investment",
@@ -477,7 +476,7 @@ def assemble_feature_matrix(monthly_df, drop_lags_na=True):
             ],
             "description": "Total investment + sale flag + NPS control"
         },
-        "spec_C_top_channels": {
+        "model_C_top_channels": {
             "target": "log_total_gmv",
             "features": [
                 "log_Online.marketing",
@@ -486,7 +485,7 @@ def assemble_feature_matrix(monthly_df, drop_lags_na=True):
             ],
             "description": "Top 2 correlated channels + sale flag"
         },
-        "spec_D_with_momentum": {
+        "model_D_with_lag": {
             "target": "log_total_gmv",
             "features": [
                 "log_spend_digital_performance",
@@ -495,7 +494,7 @@ def assemble_feature_matrix(monthly_df, drop_lags_na=True):
             ],
             "description": "Digital performance + sale flag + lagged GMV (momentum)"
         },
-        "spec_E_discount_effect": {
+        "model_E_discount": {
             "target": "log_total_gmv",
             "features": [
                 "log_Total_Investment",
@@ -503,33 +502,6 @@ def assemble_feature_matrix(monthly_df, drop_lags_na=True):
                 "sale_flag"
             ],
             "description": "Total investment + discount intensity + sale flag"
-        },
-        "spec_F_mixed_channels": {
-            "target": "log_total_gmv",
-            "features": [
-                "log_Affiliates",
-                "log_TV",
-                "sale_flag"
-            ],
-            "description": "Performance (Affiliates) + brand (TV) + sale events"
-        },
-        "spec_G_spend_only": {
-            "target": "log_total_gmv",
-            "features": [
-                "log_spend_digital_performance",
-                "log_spend_traditional",
-                "discount_intensity"
-            ],
-            "description": "All spend groups + discount, no sale flag"
-        },
-        "spec_H_sale_duration": {
-            "target": "log_total_gmv",
-            "features": [
-                "log_Total_Investment",
-                "sale_days",
-                "nps_standardized"
-            ],
-            "description": "Total spend + sale duration + NPS"
         }
     }
 
