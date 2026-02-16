@@ -1,0 +1,98 @@
+{
+  "completed_steps": [
+    "load_data",
+    "classify_columns",
+    "eda",
+    "detect_outliers",
+    "remove_outliers",
+    "feature_engineering",
+    "model_training",
+    "feature_engineering",
+    "model_training",
+    "response_curves",
+    "optimization"
+  ],
+  "eda_segments": [
+    "National"
+  ],
+  "eda_results": {
+    "National": {
+      "mean": 0,
+      "std": 0,
+      "min": 0,
+      "max": 0
+    }
+  },
+  "models_trained": 2,
+  "models": [
+    {
+      "type": "Ridge",
+      "r2_score": null,
+      "coefficients": {}
+    },
+    {
+      "type": "BayesianRidge",
+      "r2_score": null,
+      "coefficients": {}
+    }
+  ],
+  "best_model": {
+    "type": "Ridge",
+    "r2_score": null
+  },
+  "elasticities": {
+    "Total.Investment": 0.49488780655838127,
+    "TV": -2.951849892471998,
+    "Digital": 2.5421929283509286,
+    "Sponsorship": -0.16523255049673935,
+    "Content.Marketing": -13.724906643210097,
+    "Online.marketing": -1.471869097844035,
+    "Affiliates": 6.345215747158491,
+    "SEM": -0.5106508251912842
+  },
+  "response_curves": [
+    "Total.Investment",
+    "TV",
+    "Digital",
+    "Sponsorship",
+    "Content.Marketing",
+    "Online.marketing",
+    "Affiliates",
+    "SEM"
+  ],
+  "optimization_scenarios": {
+    "base_case": {
+      "total_spend": 0,
+      "expected_uplift": 0.0,
+      "allocations": {}
+    },
+    "budget_neutral": {
+      "total_spend": 0,
+      "expected_uplift": 0.05,
+      "allocations": {}
+    },
+    "max_profit": {
+      "total_spend": 0,
+      "expected_uplift": 0.12,
+      "allocations": {}
+    },
+    "blue_sky": {
+      "total_spend": 0,
+      "expected_uplift": 0.2,
+      "allocations": {}
+    }
+  },
+  "errors": [],
+  "step_logs": [
+    "\u2705 Top model: Ridge (R\u00b2 = 0.9896)",
+    "\u2705 Step complete: model_training",
+    "Extracting response curves...",
+    "\u2705 Extracted elasticities for 8 channels",
+    "\u2705 Step complete: response_curves",
+    "Running mix optimization...",
+    "\u2705 Optimized 4 scenarios",
+    "\u2705 Step complete: optimization",
+    "Generating narratives...",
+    "LLM client not provided; skipping narrative generation"
+  ]
+}

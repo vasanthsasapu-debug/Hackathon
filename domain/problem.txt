@@ -1,0 +1,48 @@
+Domain 3: Commercial, Agentic MMx
+Problem
+Marketing Mix (MMiX) in pharma is widely used but largely retrospective and manual. Budget decisions are slow, and evidence is scattered (MMM slides, ad-hoc experiments, agency emails). Teams miss in-quarter opportunities because reallocation requires multiple handoffs and re-runs.
+Opportunity (What we’ll build)
+Create an Agentic MMiX Workflow that:
+Reads a predefined dataset with all HCP level promotional activities, sales and demographics data and automatically assigns category of each column (e.g., HCP_ID = HCP Identifier; Month = Time_Stamp; Calls = promotional_activity).
+EDA:  Does an EDA for all channels at national and segment level
+Reach, Frequency and Engagement summary for all channels at segment level
+Overlap of reach between sales and different promotional channels
+Overlap of reach between personal and digital channels
+Correlation between sales and different promotional channels
+Generates GenAI summaries for each step
+Ability to export summaries in Excel and PPT
+Outlier removal: Automatically removes outlier per pre-defined rules (ability to do outlier removal at national as well as segment level)
+Generates GenAI summaries for rational behind outlier removal
+Feature Engineering:
+Automatically defines transformation (diminishing return: e.g., log) and displays a plot between delta sales and activity with the transformation curve and fit
+Ability to combine similar channels (required when multi-collinearity in the system is high)
+Generates GenAI summaries rationalizing the functional forms
+Model construct: Ability to choose model granularity at entity and time level
+Modeling:  Automatically runs incremental model starting with most important channel e.g., calls and keep segment as class variable at each step
+Ensure ordinality for important channels (calls, speaker programs, rep email, HQ email)
+Ensures good model fit – avoid over fitting
+Ensures model robustness by performing cross validation
+Ability to go back to outlier removal or feature engineering – if required
+Generates GenAI summaries for model performance and rationale
+Ability to automatically run GLM, Bayesian, Fixed Effect, Random Effect models for each variation
+Ability to score model performance basis: Model Fit, Model Stability and Ordinality, and display top 10 models basis score
+GenAI summary for the rationale behind why these models are top models and recommendation for best model
+GenAI Critique the solution and use strategies such as Feature transformation, outlier removal and feature removal to ensure the outcome is statistically significant and aligned
+Ability to visualize the displayed models
+Ability to select and further finetune a model
+Ability to display response curves at national and/or segment level for each channel
+Ability to export the final model and move to optimization with a click of a button
+Mix Optimization (OPTIONAL):
+Automatically takes all the response curves and creates 3 scenarios:
+Base Case Scenario: No optimization; Use response curves and historical execution
+Budget Neutral: Fix spend for each channel to base case and optimize within channel at segment level for maximum profit
+Maximum Profit with Current spend: Keep overall spend fixed (but channel level spend can change) and optimize for maximum profit based allocation across channels and segments
+Blue Sky scenario: Don’t keep any spend fixed and optimize for maximum profit (mROI =0%)
+Ability for user to change constraints basis prompt
+Ability for user to create additional scenarios basis prompt
+Ability to compare and contrast across scenarios
+Visualize all the scenarios
+Ability to export selected scenarios in PPT
+Goal-based Optimization
+NLP based optimization formulation and model trigger (E.g. what strategy can help to further increase the mROI for Email as a channel by 2%)
+Narration
