@@ -1,81 +1,262 @@
 """
 =============================================================================
-MAIN ENTRY POINT -- Complete Agentic MMIX Pipeline
+MMIX PIPELINE -- Main Entry Point
 =============================================================================
-Orchestrates all 3 components:
-  1. Core Pipeline (EDA, Outlier Detection, Features, Modeling)
-  2. Agentic Wrapper (LLM Integration, State Management, Feedback Loops)
-  3. Polish (Optimization, Export, Reporting)
-=============================================================================
+
+Orchestrates end-to-end MMIX workflow with dynamic modes:
+  - deterministic: Run all steps, no LLM (fast, cost-effective)
+  - agentic: Run all steps + LLM narratives (rich output, higher cost)
+
+Usage:
+  python main.py --data data/Secondfile.csv --mode deterministic --output-dir outputs/
+  python main.py --data data/Secondfile.csv --mode agentic --output-dir outputs/
 """
 
+import argparse
+import pandas as pd
 import sys
-import os
 from pathlib import Path
+from typing import Dict
 
-# Add src to path
+# Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-import pandas as pd
-import numpy as np
-from typing import Dict, Optional
+from agents.orchestrator import PipelineState, run_pipeline
+from agents.llm import get_llm_client
 
-# Import components
-from mmix.agents.orchestrator import Orchestrator
-from mmix.agents.llm import get_llm_client
-from mmix.export.excel import export_to_excel
-from mmix.export.powerpoint import generate_ppt_presentation
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="MMIX Marketing Mix Modeling Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Fast deterministic run
+  python main.py --data data/Secondfile.csv --mode deterministic
+  
+  # Full agentic run with narratives
+  python main.py --data data/Secondfile.csv --mode agentic --output-dir outputs/
+  
+  # Custom output directory
+  python main.py --data data/Sales.csv --mode deterministic --output-dir results/
+        """
+    )
+    
+    parser.add_argument(
+        "--data",
+        type=str,
+        default="data/Secondfile.csv",
+        help="Path to input CSV file (default: data/Secondfile.csv)"
+    )
+    
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["deterministic", "agentic"],
+        default="deterministic",
+        help="Execution mode: deterministic (fast, no LLM) or agentic (with narratives)"
+    )
+    
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="outputs",
+        help="Output directory for results (default: outputs)"
+    )
+    
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+    
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Optional: Path to checkpoint JSON to resume from"
+    )
+    
+    return parser.parse_args()
 
 
 # =============================================================================
 # DATA LOADING
 # =============================================================================
 
-def load_data_from_directory(data_dir: str) -> Dict[str, pd.DataFrame]:
+def load_data(csv_path: str) -> pd.DataFrame:
     """
-    Load all CSV files from data directory.
+    Load CSV file with error handling.
     
     Args:
-        data_dir: Path to data folder
+        csv_path: Path to CSV file
         
     Returns:
-        {filename: dataframe}
-    """
-    data = {}
-    
-    file_mapping = {
-        "firstfile.csv": "transactions",
-        "Sales.csv": "sales",
-        "Secondfile.csv": "monthly",
-        "SpecialSale.csv": "special_sales",
-        "MediaInvestment.csv": "media_investment",
-        "MonthlyNPSscore.csv": "nps",
-        "ProductList.csv": "products",
-    }
-    
-    for filename, label in file_mapping.items():
-        filepath = os.path.join(data_dir, filename)
+        Pandas DataFrame
         
-        if os.path.exists(filepath):
-            try:
-                if filename == "Sales.csv":
-                    # Tab-delimited
-                    df = pd.read_csv(filepath, sep="\t", parse_dates=["Date"])
-                else:
-                    df = pd.read_csv(filepath)
-                
-                data[label] = df
-                print(f"✅ Loaded {label}: {df.shape[0]} rows, {df.shape[1]} columns")
-            except Exception as e:
-                print(f"❌ Error loading {filename}: {str(e)}")
-        else:
-            print(f"⚠️  {filename} not found")
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        ValueError: If file is empty or corrupted
+    """
+    csv_path = Path(csv_path)
     
-    return data
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Data file not found: {csv_path}")
+    
+    print(f"📂 Loading data from: {csv_path}")
+    
+    try:
+        df = pd.read_csv(csv_path)
+        print(f"   ✅ Loaded {len(df)} rows, {len(df.columns)} columns")
+        return df
+    except Exception as e:
+        raise ValueError(f"Failed to load CSV: {str(e)}")
 
 
 # =============================================================================
-# MAIN PIPELINE
+# OUTPUT DIRECTORY SETUP
+# =============================================================================
+
+def setup_output_directory(output_dir: str) -> Path:
+    """
+    Create output directory if it doesn't exist.
+    
+    Args:
+        output_dir: Directory path
+        
+    Returns:
+        Path object
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    print(f"📁 Output directory: {output_path}")
+    return output_path
+
+
+# =============================================================================
+# MODE VALIDATION
+# =============================================================================
+
+def validate_mode(mode: str) -> None:
+    """
+    Validate execution mode and check prerequisites.
+    
+    Args:
+        mode: "deterministic" or "agentic"
+        
+    Raises:
+        ValueError: If agentic mode but Azure OpenAI not configured
+    """
+    if mode == "agentic":
+        print("🤖 Agentic mode: Will generate LLM narratives")
+        try:
+            client = get_llm_client()
+            print("   ✅ Azure OpenAI client initialized")
+        except ValueError as e:
+            print(f"   ❌ Azure OpenAI not configured: {str(e)}")
+            print("   💡 Falling back to deterministic mode")
+    elif mode == "deterministic":
+        print("⚡ Deterministic mode: Fast execution, no LLM")
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+def main():
+    """Main entry point."""
+    print("=" * 80)
+    print(" MMIX MARKETING MIX MODELING PIPELINE")
+    print("=" * 80)
+    
+    # Parse arguments
+    args = parse_arguments()
+    
+    print(f"\n📋 Configuration:")
+    print(f"   Data file: {args.data}")
+    print(f"   Mode: {args.mode}")
+    print(f"   Output dir: {args.output_dir}")
+    print(f"   Verbose: {args.verbose}")
+    
+    # Load data
+    print(f"\n{'─' * 80}")
+    try:
+        df = load_data(args.data)
+    except Exception as e:
+        print(f"❌ Error loading data: {str(e)}")
+        sys.exit(1)
+    
+    # Setup output directory
+    output_path = setup_output_directory(args.output_dir)
+    
+    # Validate mode
+    print(f"\n{'─' * 80}")
+    validate_mode(args.mode)
+    
+    # Initialize pipeline state
+    print(f"\n{'─' * 80}")
+    print("🔧 Initializing pipeline state...")
+    
+    state = PipelineState(
+        data={"main": df},
+        mode=args.mode,
+        output_dir=str(output_path),
+        verbose=args.verbose
+    )
+    state.log("Pipeline initialized")
+    
+    # Run pipeline
+    print(f"\n{'─' * 80}")
+    print("🚀 Running pipeline...\n")
+    
+    # Initialize LLM client if agentic mode
+    llm_client = None
+    if args.mode == "agentic":
+        try:
+            llm_client = get_llm_client()
+        except ValueError as e:
+            print(f"   ⚠️  {str(e)}")
+            print("   💡 Falling back to deterministic mode")
+            state.mode = "deterministic"
+    
+    try:
+        state = run_pipeline(state, llm_client)
+        print(f"\n{'─' * 80}")
+        print("✅ Pipeline completed successfully!")
+        
+        # Summary
+        print(f"\n📊 Summary:")
+        print(f"   Steps completed: {len(state.completed_steps)}")
+        for step in state.completed_steps:
+            print(f"     ✓ {step}")
+        
+        if state.errors:
+            print(f"\n   Warnings/Errors ({len(state.errors)}):")
+            for error in state.errors:
+                print(f"     ⚠️  {error}")
+        
+        print(f"\n   Output directory: {output_path}")
+        
+    except Exception as e:
+        print(f"\n❌ Pipeline failed: {str(e)}")
+        
+        if state.errors:
+            print(f"\n   Errors encountered:")
+            for error in state.errors:
+                print(f"     • {error}")
+        
+        sys.exit(1)
+    
+    print("\n" + "=" * 80)
+
+
+# =============================================================================
+# LEGACY SUPPORT (for backward compatibility)
 # =============================================================================
 
 def run_full_mmix_pipeline(
@@ -86,40 +267,27 @@ def run_full_mmix_pipeline(
     output_dir: str = "outputs"
 ) -> Dict:
     """
-    Run the complete Agentic MMIX pipeline.
+    LEGACY: Run the complete MMIX pipeline (old interface).
     
-    Args:
-        data_dir: Path to input data folder
-        enable_llm: Include GenAI narratives
-        export_excel: Export results to Excel
-        export_ppt: Export results to PowerPoint
-        output_dir: Directory for outputs
-        
-    Returns:
-        {
-            "state": PipelineState,
-            "data": loaded data,
-            "status": success/failure
-        }
+    TODO (V2): Remove after migrating to new interface.
     """
-    print("\n" + "="*80)
-    print("AGENTIC MMIX PIPELINE - STARTING")
-    print("="*80 + "\n")
+    print("\n⚠️  Using legacy run_full_mmix_pipeline() interface")
+    print("   Recommend: Use new main.py with args instead\n")
     
     # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     
     # Load data
     print("Step 1: Loading Data")
     print("-" * 80)
-    data_dir_path = os.path.join(os.path.dirname(__file__), data_dir)
-    data = load_data_from_directory(data_dir_path)
+    data_dir_path = Path(__file__).parent / data_dir
     
-    if not data:
-        print("❌ No data loaded. Exiting.")
-        return {"status": "failed", "error": "No data loaded"}
-    
-    print()
+    try:
+        df = pd.read_csv(data_dir_path / "Secondfile.csv")
+        print(f"✅ Loaded: {df.shape[0]} rows, {df.shape[1]} columns")
+    except Exception as e:
+        print(f"❌ Error loading data: {str(e)}")
+        return {"status": "failed", "error": str(e)}
     
     # Initialize LLM client (optional)
     llm_client = None
@@ -130,118 +298,33 @@ def run_full_mmix_pipeline(
             llm_client = get_llm_client()
         except Exception as e:
             print(f"⚠️  LLM initialization failed: {str(e)}")
-            print("   Continuing without LLM narratives...")
-        print()
     
-    # Run orchestrator
+    # Run new pipeline
     print("Step 3: Running Agentic Pipeline")
     print("-" * 80)
-    orchestrator = Orchestrator(data, llm_client)
-    state = orchestrator.run_full_pipeline(auto_feedback_loop=True)
     
-    print()
-    
-    # Summary
-    print("Step 4: Pipeline Summary")
-    print("-" * 80)
-    orchestrator.print_summary()
-    
-    print()
-    
-    # Export state
-    state_json_path = os.path.join(output_dir, "pipeline_state.json")
-    orchestrator.export_state_to_json(state_json_path)
-    
-    # Export Excel (if requested)
-    if export_excel:
-        print("Step 5: Exporting to Excel")
-        print("-" * 80)
-        excel_path = os.path.join(output_dir, "MMIX_Analysis_Results.xlsx")
-        
-        export_to_excel(
-            excel_path,
-            eda_results=state.eda_results if state.eda_results else None,
-            ranked_models=state.ranked_models if state.ranked_models else None,
-            elasticities=state.elasticities if state.elasticities else None,
-            scenarios=state.optimization_scenarios if state.optimization_scenarios else None,
-            narratives={
-                "EDA": state.eda_narrative,
-                "Outlier Removal": state.outlier_narrative,
-                "Feature Engineering": state.feature_narrative,
-                "Models": state.model_narrative,
-                "Optimization": state.optimization_narrative,
-            }
+    try:
+        state = PipelineState(
+            data={"main": df},
+            mode="agentic" if enable_llm else "deterministic",
+            output_dir=output_dir,
         )
-        print()
-    
-    # Export PowerPoint (if requested)
-    if export_ppt:
-        print("Step 6: Exporting to PowerPoint")
-        print("-" * 80)
-        ppt_path = os.path.join(output_dir, "MMIX_Analysis_Report.pptx")
+        state = run_pipeline(state)
+        print("✅ Pipeline completed")
         
-        eda_narratives = {}
-        if state.eda_results:
-            for segment_name in state.eda_results.keys():
-                eda_narratives[segment_name] = state.eda_narrative
-        
-        generate_ppt_presentation(
-            ppt_path,
-            eda_narratives=eda_narratives if eda_narratives else {"National": state.eda_narrative},
-            outlier_narrative=state.outlier_narrative,
-            feature_narrative=state.feature_narrative,
-            model_narrative=state.model_narrative,
-            optimization_narrative=state.optimization_narrative,
-            recommendations=[
-                "Prioritize high-elasticity channels for budget allocation",
-                "Implement quarterly model rebalancing based on response curves",
-                "Monitor ordinality constraints to ensure realistic predictions",
-                "Consider blue-sky scenario for strategic long-term planning",
-            ]
-        )
-        print()
-    
-    print("\n" + "="*80)
-    print("PIPELINE COMPLETE ✅")
-    print("="*80)
-    print(f"\nOutputs saved to: {os.path.abspath(output_dir)}")
-    print(f"  - pipeline_state.json")
-    if export_excel:
-        print(f"  - MMIX_Analysis_Results.xlsx")
-    if export_ppt:
-        print(f"  - MMIX_Analysis_Report.pptx")
-    print()
-    
-    return {
-        "status": "success",
-        "state": state,
-        "data": data,
-        "output_dir": output_dir,
-    }
+        return {
+            "status": "success",
+            "state": state,
+        }
+    except Exception as e:
+        print(f"❌ Pipeline failed: {str(e)}")
+        return {"status": "failed", "error": str(e)}
 
 
 # =============================================================================
-# CLI INTERFACE
+# ENTRY POINT
 # =============================================================================
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Agentic MMIX Pipeline")
-    parser.add_argument("--data-dir", default="data", help="Path to data directory")
-    parser.add_argument("--output-dir", default="outputs", help="Path to output directory")
-    parser.add_argument("--no-llm", action="store_true", help="Disable LLM narratives")
-    parser.add_argument("--no-excel", action="store_true", help="Skip Excel export")
-    parser.add_argument("--no-ppt", action="store_true", help="Skip PowerPoint export")
-    
-    args = parser.parse_args()
-    
-    result = run_full_mmix_pipeline(
-        data_dir=args.data_dir,
-        enable_llm=not args.no_llm,
-        export_excel=not args.no_excel,
-        export_ppt=not args.no_ppt,
-        output_dir=args.output_dir,
-    )
-    
-    sys.exit(0 if result["status"] == "success" else 1)
+    main()
+
