@@ -1,22 +1,22 @@
 """
 =============================================================================
-OUTLIER DETECTION & REMOVAL -- E-Commerce MMIX
+outlier_detection.py -- Data Cleaning, Validation & Outlier Detection
 =============================================================================
-Approach: Conservative, assumption-driven.
-Philosophy: Business behavior is NOT an outlier. Only flag what's
-            statistically AND logically unjustifiable.
-
 Modules:
-  1. Assumptions Registry (documented for submission)
-  2. Transaction-Level Cleaning (firstfile.csv, Sales.csv)
-  3. Monthly Data Validation (SecondFile.csv)
-  4. Statistical Outlier Detection (IQR + Z-score)
-  5. Business-Context Outlier Review
-  6. Reconciliation Checks
-  7. Visualization
-  8. Master Pipeline
+  1. Assumptions Registry
+  2. Transaction-Level Cleaning
+  3. Monthly Data Cleaning
+  4. Weekly Data Cleaning
+  5. Statistical Outlier Detection (IQR + Z-score)
+  6. Business Context Review
+  7. Reconciliation Checks
+  8. Visualization
+  9. Master Pipeline
 =============================================================================
 """
+
+import matplotlib
+matplotlib.use("Agg")
 
 import os
 import pandas as pd
@@ -24,16 +24,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-plt.rcParams['figure.figsize'] = (14, 6)
+from config import (
+    MEDIA_CHANNELS, MODEL_SETTINGS, get_paths, get_channel_cols, find_col, logger
+)
+
+plt.rcParams["figure.figsize"] = (14, 6)
 sns.set_style("whitegrid")
-
-# =============================================================================
-# CONSTANTS
-# =============================================================================
-MEDIA_CHANNELS = ['TV', 'Digital', 'Sponsorship', 'Content.Marketing',
-                  'Online.marketing', 'Affiliates', 'SEM', 'Radio', 'Other']
 
 
 # =============================================================================
@@ -51,7 +49,7 @@ ASSUMPTIONS = {
             "The platform was new. Including a partial ramp-up month would "
             "distort elasticity estimates. Losing 1 of 12 months is costly, "
             "but keeping an anomalous point is worse for model validity."
-        )
+        ),
     },
     "A2_SALE_DISCOUNTS": {
         "description": (
@@ -63,7 +61,7 @@ ASSUMPTIONS = {
             "Discounting during sales is standard e-commerce behavior, not a "
             "data quality issue. Removing these would eliminate the very signal "
             "we need to measure promotional elasticity."
-        )
+        ),
     },
     "A3_CHANNEL_ZEROS": {
         "description": "Radio, Other, Content.Marketing show zeros in several months.",
@@ -72,7 +70,7 @@ ASSUMPTIONS = {
             "Not all channels are active every month. Zeros represent real "
             "budget decisions, not missing data. Log(x+1) handles these "
             "cleanly in regression without artificial imputation."
-        )
+        ),
     },
     "A4_NPS_VARIATION": {
         "description": "NPS ranges 44-60 across 12 months.",
@@ -83,7 +81,7 @@ ASSUMPTIONS = {
             "this is confounded by seasonality -- high-demand months have "
             "lower NPS due to delivery pressure. NPS is a control variable, "
             "not a causal driver in this context."
-        )
+        ),
     },
     "A5_SEASONAL_PEAKS": {
         "description": (
@@ -94,7 +92,7 @@ ASSUMPTIONS = {
         "reasoning": (
             "Festival-season peaks are the core business pattern we are "
             "modeling. Removing them would eliminate the signal entirely."
-        )
+        ),
     },
     "A6_DISCOUNT_ENDOGENEITY": {
         "description": "Discount may be endogenous (company discounts more when sales are low).",
@@ -106,7 +104,7 @@ ASSUMPTIONS = {
             "If the company increases discounts in response to low sales, "
             "the discount coefficient will be biased. Using it as a control "
             "rather than a lever avoids misinterpreting reverse causality."
-        )
+        ),
     },
     "A7_SAMPLE_SIZE": {
         "description": (
@@ -116,13 +114,13 @@ ASSUMPTIONS = {
         "decision": (
             "Proceed with simpler models (max 3-4 predictors). "
             "No seasonal dummies (would consume all degrees of freedom). "
-            "Use quarterly/half-year indicators instead if needed."
+            "Use weekly aggregation to increase n to ~48."
         ),
         "reasoning": (
             "With n=12 (or 11 after Aug exclusion), degrees of freedom are "
-            "severely limited. Rule of thumb: n/3 to n/5 predictors max. "
-            "Simpler models with fewer predictors will be more stable."
-        )
+            "severely limited. Weekly aggregation provides ~48 data points, "
+            "enabling individual channel modeling and proper cross-validation."
+        ),
     },
     "A8_SALES_GMV_DTYPE": {
         "description": (
@@ -134,12 +132,10 @@ ASSUMPTIONS = {
             "Object dtype in a numeric field indicates data quality issues "
             "at source. Coercing to numeric and dropping failures is the "
             "standard safe approach."
-        )
+        ),
     },
     "A9_RADIO_OTHER_SPURIOUS": {
-        "description": (
-            "Radio and Other show strong negative correlation (-0.95) with GMV."
-        ),
+        "description": "Radio and Other show strong negative correlation (-0.95) with GMV.",
         "decision": "Exclude from individual channel modeling or merge into residual bucket.",
         "reasoning": (
             "These channels have data only in a few months. The months they "
@@ -147,8 +143,8 @@ ASSUMPTIONS = {
             "negative correlation. This is not causal -- Radio does not hurt "
             "sales. The pattern is an artifact of sparse, non-overlapping "
             "activity periods."
-        )
-    }
+        ),
+    },
 }
 
 
@@ -172,505 +168,577 @@ def print_assumptions():
 def clean_transactions(df, dataset_name="transactions"):
     """
     Clean transaction-level data (firstfile.csv or Sales.csv).
-    Returns: cleaned df, removal log
+
+    Removes: negative GMV, negative units, negative discount, NaN GMV,
+             GMV=0 with units>0 (recording error).
+    Flags:   discount > MRP (impossible but kept for review).
+
+    Returns:
+        (cleaned_df, log_list)
     """
     log = []
-    original_len = len(df)
-    print(f"\n[CLEAN] {dataset_name} ({original_len:,} rows)")
+    n_start = len(df)
+    logger.info("Cleaning %s (%s rows)", dataset_name, f"{n_start:,}")
 
-    gmv_col = _find_col(df, ['gmv_new', 'GMV', 'gmv'])
-    units_col = _find_col(df, ['units', 'Units_sold', 'Units'])
-    mrp_col = _find_col(df, ['product_mrp', 'MRP', 'mrp'])
-    discount_col = _find_col(df, ['discount', 'Discount'])
+    gmv_col = find_col(df, ["gmv_new", "GMV", "gmv"])
+    units_col = find_col(df, ["units", "Units_sold", "Units"])
+    mrp_col = find_col(df, ["product_mrp", "MRP", "mrp"])
+    discount_col = find_col(df, ["discount", "Discount"])
 
-    # Coerce GMV to numeric (handles Sales.csv object dtype)
+    # Coerce GMV to numeric
     if gmv_col:
-        before_nan = df[gmv_col].isna().sum()
-        df[gmv_col] = pd.to_numeric(df[gmv_col], errors='coerce')
-        after_nan = df[gmv_col].isna().sum()
-        coerced_nan = after_nan - before_nan
-        if coerced_nan > 0:
-            msg = f"Coerced {coerced_nan} non-numeric GMV values to NaN"
-            log.append({"step": "gmv_coerce", "rows_affected": coerced_nan, "reason": msg})
-            print(f"  [INFO] {msg}")
+        before = df[gmv_col].isna().sum()
+        df[gmv_col] = pd.to_numeric(df[gmv_col], errors="coerce")
+        coerced = df[gmv_col].isna().sum() - before
+        if coerced > 0:
+            log.append({"step": "gmv_coerce", "rows_affected": coerced,
+                        "reason": f"Coerced {coerced} non-numeric GMV to NaN"})
+            logger.info("  [INFO] Coerced %d non-numeric GMV to NaN", coerced)
 
-    # Remove negative GMV -- impossible value
+    # Negative GMV
     if gmv_col:
-        neg_gmv = (df[gmv_col] < 0).sum()
-        if neg_gmv > 0:
+        n = (df[gmv_col] < 0).sum()
+        if n > 0:
             df = df[df[gmv_col] >= 0]
-            msg = f"Removed {neg_gmv} rows with negative GMV (impossible value)"
-            log.append({"step": "negative_gmv", "rows_removed": neg_gmv, "reason": msg})
-            print(f"  [OK] {msg}")
+            log.append({"step": "negative_gmv", "rows_removed": n,
+                        "reason": f"Removed {n} negative GMV rows"})
+            logger.info("  [OK] Removed %d negative GMV rows", n)
 
-    # Remove GMV=0 but units>0 -- data error (sold items but no revenue recorded)
+    # GMV=0 with units>0
     if gmv_col and units_col:
-        df[units_col] = pd.to_numeric(df[units_col], errors='coerce')
-        bad_rows = ((df[gmv_col] == 0) & (df[units_col] > 0)).sum()
-        if bad_rows > 0:
+        df[units_col] = pd.to_numeric(df[units_col], errors="coerce")
+        n = ((df[gmv_col] == 0) & (df[units_col] > 0)).sum()
+        if n > 0:
             df = df[~((df[gmv_col] == 0) & (df[units_col] > 0))]
-            msg = f"Removed {bad_rows} rows with GMV=0 but units>0 (recording error)"
-            log.append({"step": "zero_gmv_with_units", "rows_removed": bad_rows, "reason": msg})
-            print(f"  [OK] {msg}")
+            log.append({"step": "zero_gmv_units", "rows_removed": n,
+                        "reason": f"Removed {n} rows: GMV=0 but units>0"})
+            logger.info("  [OK] Removed %d rows: GMV=0 but units>0", n)
 
-    # Remove negative units -- impossible value
+    # Negative units
     if units_col:
-        neg_units = (df[units_col] < 0).sum()
-        if neg_units > 0:
+        n = (df[units_col] < 0).sum()
+        if n > 0:
             df = df[df[units_col] >= 0]
-            msg = f"Removed {neg_units} rows with negative units (impossible value)"
-            log.append({"step": "negative_units", "rows_removed": neg_units, "reason": msg})
-            print(f"  [OK] {msg}")
+            log.append({"step": "negative_units", "rows_removed": n,
+                        "reason": f"Removed {n} negative unit rows"})
+            logger.info("  [OK] Removed %d negative unit rows", n)
 
-    # Flag impossible discounts (discount > MRP) -- keep but flag
+    # Flag impossible discounts (discount > MRP)
     if discount_col and mrp_col:
-        df[discount_col] = pd.to_numeric(df[discount_col], errors='coerce')
-        df[mrp_col] = pd.to_numeric(df[mrp_col], errors='coerce')
-        impossible = ((df[discount_col] > df[mrp_col]) & df[mrp_col].notna()).sum()
-        if impossible > 0:
-            df['flag_impossible_discount'] = (
+        df[discount_col] = pd.to_numeric(df[discount_col], errors="coerce")
+        df[mrp_col] = pd.to_numeric(df[mrp_col], errors="coerce")
+        n = ((df[discount_col] > df[mrp_col]) & df[mrp_col].notna()).sum()
+        if n > 0:
+            df["flag_impossible_discount"] = (
                 (df[discount_col] > df[mrp_col]) & df[mrp_col].notna()
             ).astype(int)
-            msg = (f"Flagged {impossible} rows where discount > MRP "
-                   f"(kept for review, not removed)")
-            log.append({"step": "impossible_discount_flag", "rows_flagged": impossible, "reason": msg})
-            print(f"  [WARN] {msg}")
+            log.append({"step": "impossible_discount", "rows_flagged": n,
+                        "reason": f"Flagged {n} rows: discount > MRP (kept)"})
+            logger.warning("  [WARN] Flagged %d rows: discount > MRP", n)
 
-    # Remove negative discounts -- impossible value
+    # Negative discounts
     if discount_col:
-        neg_disc = (df[discount_col] < 0).sum()
-        if neg_disc > 0:
+        n = (df[discount_col] < 0).sum()
+        if n > 0:
             df = df[df[discount_col] >= 0]
-            msg = f"Removed {neg_disc} rows with negative discount (impossible value)"
-            log.append({"step": "negative_discount", "rows_removed": neg_disc, "reason": msg})
-            print(f"  [OK] {msg}")
+            log.append({"step": "negative_discount", "rows_removed": n,
+                        "reason": f"Removed {n} negative discount rows"})
+            logger.info("  [OK] Removed %d negative discount rows", n)
 
-    # Drop NaN GMV rows from coercion
+    # Drop NaN GMV
     if gmv_col:
-        nan_gmv = df[gmv_col].isna().sum()
-        if nan_gmv > 0:
+        n = df[gmv_col].isna().sum()
+        if n > 0:
             df = df.dropna(subset=[gmv_col])
-            msg = f"Removed {nan_gmv} rows with NaN GMV (non-parseable values)"
-            log.append({"step": "nan_gmv", "rows_removed": nan_gmv, "reason": msg})
-            print(f"  [OK] {msg}")
+            log.append({"step": "nan_gmv", "rows_removed": n,
+                        "reason": f"Removed {n} NaN GMV rows"})
+            logger.info("  [OK] Removed %d NaN GMV rows", n)
 
-    final_len = len(df)
-    total_removed = original_len - final_len
-    pct = (total_removed / original_len * 100) if original_len > 0 else 0
-    print(f"  [SUMMARY] {dataset_name}: {original_len:,} -> {final_len:,} "
-          f"({total_removed:,} removed, {pct:.2f}%)")
+    n_end = len(df)
+    removed = n_start - n_end
+    pct = (removed / n_start * 100) if n_start > 0 else 0
+    logger.info("  [SUMMARY] %s: %s -> %s (%s removed, %.2f%%)",
+                dataset_name, f"{n_start:,}", f"{n_end:,}", f"{removed:,}", pct)
 
     return df, log
 
 
 # =============================================================================
-# 3. MONTHLY DATA VALIDATION & CLEANING
+# 3. MONTHLY DATA CLEANING
 # =============================================================================
 
 def clean_monthly(df):
     """
-    Validate and clean the monthly aggregated dataset (SecondFile.csv).
-    Returns: cleaned df, removal log, validation results
+    Validate and clean monthly aggregated data (SecondFile.csv).
+
+    Returns:
+        (cleaned_df, log_list, validation_dict)
     """
     log = []
     validation = {}
-    print(f"\n[CLEAN] Monthly Data ({len(df)} rows)")
+    logger.info("Cleaning Monthly Data (%d rows)", len(df))
 
-    if 'Date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['Date']):
-        df['Date'] = pd.to_datetime(df['Date'])
-    df = df.sort_values('Date').reset_index(drop=True)
+    if "Date" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["Date"]):
+        df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date").reset_index(drop=True)
 
-    # Duplicate date check
-    if 'Date' in df.columns:
-        dup_dates = df['Date'].duplicated().sum()
-        validation['duplicate_dates'] = dup_dates
-        if dup_dates > 0:
-            print(f"  [WARN] {dup_dates} duplicate dates found -- removing")
-            df = df.drop_duplicates(subset='Date', keep='first')
-            log.append({"step": "duplicate_dates", "rows_removed": dup_dates,
-                        "reason": "Duplicate monthly records removed (kept first occurrence)"})
+    # Duplicate dates
+    if "Date" in df.columns:
+        dups = df["Date"].duplicated().sum()
+        validation["duplicate_dates"] = dups
+        if dups > 0:
+            df = df.drop_duplicates(subset="Date", keep="first")
+            log.append({"step": "dup_dates", "rows_removed": dups,
+                        "reason": f"Removed {dups} duplicate dates"})
+            logger.warning("  [WARN] Removed %d duplicate dates", dups)
         else:
-            print("  [OK] No duplicate dates")
+            logger.info("  [OK] No duplicate dates")
 
     # Aug 2015 exclusion (Assumption A1)
-    ratio = None
     aug_excluded = False
-    if 'Date' in df.columns and 'total_gmv' in df.columns:
-        aug_2015 = df[(df['Date'].dt.year == 2015) & (df['Date'].dt.month == 8)]
-        if len(aug_2015) > 0:
-            median_gmv = df['total_gmv'].median()
-            aug_gmv = aug_2015['total_gmv'].values[0]
+    if "Date" in df.columns and "total_gmv" in df.columns:
+        aug = df[(df["Date"].dt.year == 2015) & (df["Date"].dt.month == 8)]
+        if len(aug) > 0:
+            median_gmv = df["total_gmv"].median()
+            aug_gmv = aug["total_gmv"].values[0]
             ratio = aug_gmv / median_gmv if median_gmv > 0 else 0
-
             if ratio < 0.05:
-                df = df[~((df['Date'].dt.year == 2015) & (df['Date'].dt.month == 8))]
-                msg = (f"EXCLUDED Aug 2015: GMV={aug_gmv/1e7:.2f}Cr is {ratio*100:.1f}% "
-                       f"of median {median_gmv/1e7:.1f}Cr "
-                       f"(Assumption A1: platform ramp-up period)")
-                log.append({"step": "aug_2015_exclusion", "rows_removed": 1, "reason": msg})
-                print(f"  [EXCLUDE] {msg}")
+                df = df[~((df["Date"].dt.year == 2015) & (df["Date"].dt.month == 8))]
+                msg = (f"EXCLUDED Aug 2015: GMV={aug_gmv / 1e7:.2f}Cr is "
+                       f"{ratio * 100:.1f}% of median {median_gmv / 1e7:.1f}Cr")
+                log.append({"step": "aug_2015", "rows_removed": 1, "reason": msg})
+                logger.info("  [EXCLUDE] %s", msg)
                 aug_excluded = True
             else:
-                print(f"  [INFO] Aug 2015 GMV ratio = {ratio*100:.1f}% -- keeping")
-    validation['aug_2015_excluded'] = aug_excluded
+                logger.info("  [INFO] Aug 2015 GMV ratio %.1f%% -- keeping", ratio * 100)
+    validation["aug_2015_excluded"] = aug_excluded
 
-    # Negative value check -- impossible for revenue/spend metrics
-    num_cols = df.select_dtypes(include=[np.number]).columns
-    for col in num_cols:
-        neg_count = (df[col] < 0).sum()
-        if neg_count > 0:
-            print(f"  [WARN] {col}: {neg_count} negative values -- setting to 0")
+    # Negative values
+    for col in df.select_dtypes(include=[np.number]).columns:
+        n = (df[col] < 0).sum()
+        if n > 0:
             df.loc[df[col] < 0, col] = 0
-            log.append({"step": f"negative_{col}", "rows_affected": neg_count,
-                        "reason": f"Negative values in {col} set to 0 (impossible for this metric)"})
+            log.append({"step": f"neg_{col}", "rows_affected": n,
+                        "reason": f"Set {n} negative values in {col} to 0"})
+            logger.warning("  [WARN] %s: %d negatives set to 0", col, n)
 
-    # Channel spend validation -- coerce and fill zeros (Assumption A3)
-    channels = _get_channel_cols(df)
+    # Channel spend validation (Assumption A3)
+    channels = get_channel_cols(df)
     for ch in channels:
-        df[ch] = pd.to_numeric(df[ch], errors='coerce').fillna(0)
-    channel_zeros = {ch: (df[ch] == 0).sum() for ch in channels}
-    validation['channel_zero_months'] = channel_zeros
-
-    has_zeros = {ch: z for ch, z in channel_zeros.items() if z > 0}
+        df[ch] = pd.to_numeric(df[ch], errors="coerce").fillna(0)
+    zeros = {ch: (df[ch] == 0).sum() for ch in channels}
+    has_zeros = {ch: z for ch, z in zeros.items() if z > 0}
+    validation["channel_zeros"] = zeros
     if has_zeros:
-        print(f"  [INFO] Channel zero-months (Assumption A3 -- legitimate 'no spend'):")
+        logger.info("  [INFO] Channel zero-months (Assumption A3 -- no spend):")
         for ch, z in has_zeros.items():
-            print(f"         {ch:25s} -> {z} months with zero spend (kept)")
-    else:
-        print("  [OK] All channels have non-zero spend in all months")
+            logger.info("         %-25s -> %d months zero (kept)", ch, z)
 
     # NPS validation
-    if 'NPS' in df.columns:
-        nps_range = (df['NPS'].min(), df['NPS'].max())
-        validation['nps_range'] = nps_range
-        if nps_range[0] < -100 or nps_range[1] > 100:
-            print(f"  [WARN] NPS out of valid range: {nps_range}")
+    if "NPS" in df.columns:
+        nps_min, nps_max = df["NPS"].min(), df["NPS"].max()
+        validation["nps_range"] = (nps_min, nps_max)
+        if nps_min < -100 or nps_max > 100:
+            logger.warning("  [WARN] NPS out of range: [%.1f, %.1f]", nps_min, nps_max)
         else:
-            print(f"  [OK] NPS range valid: {nps_range[0]:.1f} to {nps_range[1]:.1f}")
+            logger.info("  [OK] NPS range: %.1f to %.1f", nps_min, nps_max)
 
-    # Discount sanity check
-    if 'total_Discount' in df.columns and 'total_Mrp' in df.columns:
-        df['discount_ratio'] = df['total_Discount'] / df['total_Mrp']
-        invalid = (df['discount_ratio'] > 1).sum()
+    # Discount sanity
+    if "total_Discount" in df.columns and "total_Mrp" in df.columns:
+        invalid = (df["total_Discount"] > df["total_Mrp"]).sum()
         if invalid > 0:
-            print(f"  [WARN] {invalid} months where discount > MRP (capping at MRP)")
-            df.loc[df['discount_ratio'] > 1, 'total_Discount'] = (
-                df.loc[df['discount_ratio'] > 1, 'total_Mrp']
-            )
+            df.loc[df["total_Discount"] > df["total_Mrp"], "total_Discount"] = \
+                df.loc[df["total_Discount"] > df["total_Mrp"], "total_Mrp"]
+            logger.warning("  [WARN] %d months: discount > MRP (capped)", invalid)
         else:
-            print("  [OK] All discounts <= MRP")
-        validation['discount_valid'] = invalid == 0
+            logger.info("  [OK] All discounts <= MRP")
+        validation["discount_valid"] = invalid == 0
 
-    print(f"  [SUMMARY] Monthly: {len(df)} months remaining")
-    if 'Date' in df.columns:
-        print(f"            Range: {df['Date'].min().strftime('%b-%Y')} "
-              f"to {df['Date'].max().strftime('%b-%Y')}")
+    logger.info("  [SUMMARY] Monthly: %d rows remaining", len(df))
+    if "Date" in df.columns and len(df) > 0:
+        logger.info("            Range: %s to %s",
+                     df["Date"].min().strftime("%b-%Y"),
+                     df["Date"].max().strftime("%b-%Y"))
 
     return df, log, validation
 
 
 # =============================================================================
-# 4. STATISTICAL OUTLIER DETECTION
+# 4. WEEKLY DATA CLEANING
 # =============================================================================
 
-def detect_outliers_iqr(df, columns=None, multiplier=1.5):
+def clean_weekly(weekly_df):
     """
-    Detect outliers using IQR method.
-    Flags only -- does NOT auto-remove. Business review needed.
+    Validate and clean weekly aggregated data.
+    Called after data_aggregation builds the weekly dataset.
+
+    Checks: duplicate weeks, partial weeks, zero-GMV weeks,
+            anomalously low weeks, negative values, channel/NPS validation.
+
+    Returns:
+        (cleaned_df, log_list)
     """
+    log = []
+    n_start = len(weekly_df)
+    df = weekly_df.copy()
+    logger.info("Cleaning Weekly Data (%d weeks)", n_start)
+
+    if "Date" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["Date"]):
+        df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date").reset_index(drop=True)
+
+    # Duplicate weeks
+    if "Date" in df.columns:
+        dups = df["Date"].duplicated().sum()
+        if dups > 0:
+            df = df.drop_duplicates(subset="Date", keep="first")
+            log.append({"step": "dup_weeks", "rows_removed": dups,
+                        "reason": f"Removed {dups} duplicate weeks"})
+            logger.warning("  [WARN] Removed %d duplicate weeks", dups)
+        else:
+            logger.info("  [OK] No duplicate weeks")
+
+    # Partial weeks at boundaries (< 30% of median transactions)
+    if "total_gmv" in df.columns and "n_transactions" in df.columns and len(df) > 4:
+        median_txn = df["n_transactions"].median()
+        threshold = median_txn * 0.3
+
+        # First week
+        if df.iloc[0]["n_transactions"] < threshold:
+            label = df.iloc[0]["Date"].strftime("%Y-%m-%d")
+            msg = (f"Removed first week ({label}): {df.iloc[0]['n_transactions']:.0f} "
+                   f"txns vs median {median_txn:.0f} (partial)")
+            df = df.iloc[1:].reset_index(drop=True)
+            log.append({"step": "partial_start", "rows_removed": 1, "reason": msg})
+            logger.info("  [EXCLUDE] %s", msg)
+
+        # Last week
+        if len(df) > 0 and df.iloc[-1]["n_transactions"] < threshold:
+            label = df.iloc[-1]["Date"].strftime("%Y-%m-%d")
+            msg = (f"Removed last week ({label}): {df.iloc[-1]['n_transactions']:.0f} "
+                   f"txns vs median {median_txn:.0f} (partial)")
+            df = df.iloc[:-1].reset_index(drop=True)
+            log.append({"step": "partial_end", "rows_removed": 1, "reason": msg})
+            logger.info("  [EXCLUDE] %s", msg)
+
+    # Zero-GMV weeks
+    if "total_gmv" in df.columns:
+        n = (df["total_gmv"] <= 0).sum()
+        if n > 0:
+            dates = df[df["total_gmv"] <= 0]["Date"].dt.strftime("%Y-%m-%d").tolist()
+            df = df[df["total_gmv"] > 0].reset_index(drop=True)
+            log.append({"step": "zero_gmv_weeks", "rows_removed": n,
+                        "reason": f"Removed {n} zero-GMV weeks: {dates}"})
+            logger.info("  [EXCLUDE] Removed %d zero-GMV weeks", n)
+
+    # Anomalously low weeks (< 5% of median)
+    if "total_gmv" in df.columns and len(df) > 5:
+        median = df["total_gmv"].median()
+        mask = df["total_gmv"] < median * 0.05
+        n = mask.sum()
+        if n > 0:
+            dates = df[mask]["Date"].dt.strftime("%Y-%m-%d").tolist()
+            df = df[~mask].reset_index(drop=True)
+            log.append({"step": "anomalous_weeks", "rows_removed": n,
+                        "reason": f"Removed {n} anomalous weeks (GMV < 5% median): {dates}"})
+            logger.info("  [EXCLUDE] Removed %d anomalous weeks", n)
+
+    # Negative values
+    for col in df.select_dtypes(include=[np.number]).columns:
+        n = (df[col] < 0).sum()
+        if n > 0:
+            df.loc[df[col] < 0, col] = 0
+            log.append({"step": f"neg_{col}", "rows_affected": n,
+                        "reason": f"Set {n} negatives in {col} to 0"})
+            logger.warning("  [WARN] %s: %d negatives set to 0", col, n)
+
+    # Channel coercion
+    for ch in get_channel_cols(df):
+        df[ch] = pd.to_numeric(df[ch], errors="coerce").fillna(0)
+
+    # NPS
+    if "NPS" in df.columns:
+        nps_min, nps_max = df["NPS"].min(), df["NPS"].max()
+        if nps_min < -100 or nps_max > 100:
+            logger.warning("  [WARN] NPS out of range: [%.1f, %.1f]", nps_min, nps_max)
+        else:
+            logger.info("  [OK] NPS range: %.1f to %.1f", nps_min, nps_max)
+
+    n_end = len(df)
+    logger.info("  [SUMMARY] Weekly: %d -> %d weeks (%d removed)",
+                n_start, n_end, n_start - n_end)
+    if "Date" in df.columns and len(df) > 0:
+        logger.info("            Range: %s to %s",
+                     df["Date"].min().strftime("%Y-%m-%d"),
+                     df["Date"].max().strftime("%Y-%m-%d"))
+
+    return df, log
+
+
+# =============================================================================
+# 5. STATISTICAL OUTLIER DETECTION
+# =============================================================================
+
+def detect_outliers_iqr(df, columns=None, multiplier=None):
+    """
+    Flag outliers using IQR method. Does NOT remove -- flags only.
+
+    Returns:
+        (outlier_flags_df, summary_dict)
+    """
+    multiplier = multiplier or MODEL_SETTINGS["iqr_multiplier"]
     if columns is None:
         columns = df.select_dtypes(include=[np.number]).columns.tolist()
 
-    print(f"\n[OUTLIER] IQR Detection (multiplier={multiplier})...")
-    outlier_flags = pd.DataFrame(index=df.index)
+    logger.info("IQR Outlier Detection (multiplier=%.1f)...", multiplier)
+    flags = pd.DataFrame(index=df.index)
     summary = {}
 
     for col in columns:
-        vals = pd.to_numeric(df[col], errors='coerce')
+        vals = pd.to_numeric(df[col], errors="coerce")
         if vals.isna().all():
             continue
-
-        q1 = vals.quantile(0.25)
-        q3 = vals.quantile(0.75)
+        q1, q3 = vals.quantile(0.25), vals.quantile(0.75)
         iqr = q3 - q1
-        lower = q1 - multiplier * iqr
-        upper = q3 + multiplier * iqr
-
-        is_outlier = (vals < lower) | (vals > upper)
-        outlier_flags[f'{col}_outlier'] = is_outlier.astype(int)
-
-        n_outliers = is_outlier.sum()
-        summary[col] = {
-            'q1': q1, 'q3': q3, 'iqr': iqr,
-            'lower_bound': lower, 'upper_bound': upper,
-            'n_outliers': n_outliers,
-            'pct_outliers': (n_outliers / len(df) * 100) if len(df) > 0 else 0
-        }
-
-        if n_outliers > 0:
-            outlier_vals = vals[is_outlier].tolist()
-            print(f"  [FLAG] {col}: {n_outliers} outliers "
-                  f"(bounds: [{lower:.2f}, {upper:.2f}])")
-            print(f"         Values: {outlier_vals}")
+        lo, hi = q1 - multiplier * iqr, q3 + multiplier * iqr
+        is_out = (vals < lo) | (vals > hi)
+        flags[f"{col}_outlier"] = is_out.astype(int)
+        n = is_out.sum()
+        summary[col] = {"q1": q1, "q3": q3, "iqr": iqr,
+                         "lower": lo, "upper": hi, "n_outliers": n}
+        if n > 0:
+            logger.info("  [FLAG] %s: %d outliers (bounds: [%.2f, %.2f]) values: %s",
+                        col, n, lo, hi, vals[is_out].tolist())
         else:
-            print(f"  [OK]   {col}: No outliers")
+            logger.info("  [OK]   %s: No outliers", col)
 
-    return outlier_flags, summary
+    return flags, summary
 
 
-def detect_outliers_zscore(df, columns=None, threshold=2.5):
+def detect_outliers_zscore(df, columns=None, threshold=None):
     """
-    Detect outliers using Z-score method.
-    Threshold=2.5 is relaxed for small samples (n=12).
+    Flag outliers using Z-score. Does NOT remove -- flags only.
+
+    Returns:
+        (outlier_flags_df, summary_dict)
     """
+    threshold = threshold or MODEL_SETTINGS["zscore_threshold"]
     if columns is None:
         columns = df.select_dtypes(include=[np.number]).columns.tolist()
 
-    print(f"\n[OUTLIER] Z-score Detection (threshold={threshold})...")
-    outlier_flags = pd.DataFrame(index=df.index)
+    logger.info("Z-score Outlier Detection (threshold=%.1f)...", threshold)
+    flags = pd.DataFrame(index=df.index)
     summary = {}
 
     for col in columns:
-        vals = pd.to_numeric(df[col], errors='coerce')
+        vals = pd.to_numeric(df[col], errors="coerce")
         if vals.isna().all():
             continue
-
-        mean = vals.mean()
-        std = vals.std()
+        mean, std = vals.mean(), vals.std()
         if std == 0:
-            print(f"  [SKIP] {col}: zero variance")
+            logger.info("  [SKIP] %s: zero variance", col)
             continue
-
-        z_scores = np.abs((vals - mean) / std)
-        is_outlier = z_scores > threshold
-        outlier_flags[f'{col}_zscore_outlier'] = is_outlier.astype(int)
-
-        n_outliers = is_outlier.sum()
-        summary[col] = {
-            'mean': mean, 'std': std, 'threshold': threshold,
-            'n_outliers': n_outliers
-        }
-
-        if n_outliers > 0:
-            print(f"  [FLAG] {col}: {n_outliers} outliers (|z| > {threshold})")
+        z = np.abs((vals - mean) / std)
+        is_out = z > threshold
+        flags[f"{col}_zscore"] = is_out.astype(int)
+        n = is_out.sum()
+        summary[col] = {"mean": mean, "std": std, "n_outliers": n}
+        if n > 0:
+            logger.info("  [FLAG] %s: %d outliers (|z| > %.1f)", col, n, threshold)
         else:
-            print(f"  [OK]   {col}: No outliers")
+            logger.info("  [OK]   %s: No outliers", col)
 
-    return outlier_flags, summary
+    return flags, summary
 
 
 # =============================================================================
-# 5. BUSINESS-CONTEXT OUTLIER REVIEW
+# 6. BUSINESS CONTEXT REVIEW
 # =============================================================================
 
 def business_context_review(df, special_sales_df=None):
     """
-    Review flagged outliers against business context.
-    Decides: keep (with explanation) or exclude (with justification).
+    Review each month/week against business context.
+    Decisions: KEEP, EXCLUDE, or FLAG_REVIEW.
+
+    Returns:
+        list of decision dicts
     """
-    print("\n[REVIEW] Business Context Outlier Review...")
+    logger.info("Business Context Review...")
     decisions = []
 
-    if 'Date' not in df.columns or 'total_gmv' not in df.columns:
-        print("  [WARN] Date or total_gmv column missing -- skipping")
+    if "Date" not in df.columns or "total_gmv" not in df.columns:
+        logger.warning("  Date or total_gmv missing -- skipping")
         return decisions
 
-    if not pd.api.types.is_datetime64_any_dtype(df['Date']):
-        df['Date'] = pd.to_datetime(df['Date'])
+    if not pd.api.types.is_datetime64_any_dtype(df["Date"]):
+        df["Date"] = pd.to_datetime(df["Date"])
 
-    median_gmv = df['total_gmv'].median()
+    median_gmv = df["total_gmv"].median()
 
-    # Build set of sale months
-    sale_months = set()
+    # Build sale period set
+    sale_periods = set()
     if special_sales_df is not None:
         ss = special_sales_df.copy()
-        if 'Date' in ss.columns:
-            if not pd.api.types.is_datetime64_any_dtype(ss['Date']):
-                ss['Date'] = pd.to_datetime(ss['Date'])
-            sale_months = set(ss['Date'].dt.to_period('M'))
+        if "Date" in ss.columns:
+            if not pd.api.types.is_datetime64_any_dtype(ss["Date"]):
+                ss["Date"] = pd.to_datetime(ss["Date"])
+            sale_periods = set(ss["Date"].dt.to_period("M"))
 
-    for idx, row in df.iterrows():
-        month_label = row['Date'].strftime('%b-%Y')
-        gmv = row['total_gmv']
+    for _, row in df.iterrows():
+        label = row["Date"].strftime("%b-%Y")
+        gmv = row["total_gmv"]
         ratio = gmv / median_gmv if median_gmv > 0 else 0
-        current_period = row['Date'].to_period('M')
-        is_sale_month = current_period in sale_months
+        is_sale = row["Date"].to_period("M") in sale_periods
 
         if ratio < 0.10:
-            decision = {
-                'month': month_label, 'gmv_ratio': ratio,
-                'is_sale_month': is_sale_month,
-                'action': 'EXCLUDE',
-                'reason': f'GMV at {ratio*100:.1f}% of median -- likely data issue or ramp-up'
-            }
-        elif ratio > 2.0 and is_sale_month:
-            decision = {
-                'month': month_label, 'gmv_ratio': ratio,
-                'is_sale_month': True,
-                'action': 'KEEP',
-                'reason': f'High GMV ({ratio*100:.0f}% of median) explained by sale events'
-            }
-        elif ratio > 2.0 and not is_sale_month:
-            decision = {
-                'month': month_label, 'gmv_ratio': ratio,
-                'is_sale_month': False,
-                'action': 'FLAG_REVIEW',
-                'reason': f'High GMV ({ratio*100:.0f}% of median) without known sale'
-            }
+            d = {"month": label, "ratio": ratio, "is_sale": is_sale,
+                 "action": "EXCLUDE",
+                 "reason": f"GMV {ratio * 100:.1f}% of median -- data issue or ramp-up"}
+        elif ratio > 2.0 and is_sale:
+            d = {"month": label, "ratio": ratio, "is_sale": True,
+                 "action": "KEEP",
+                 "reason": f"High GMV ({ratio * 100:.0f}%) explained by sale events"}
+        elif ratio > 2.0:
+            d = {"month": label, "ratio": ratio, "is_sale": False,
+                 "action": "FLAG_REVIEW",
+                 "reason": f"High GMV ({ratio * 100:.0f}%) without known sale"}
         else:
-            continue  # Normal range, no action needed
+            continue  # Normal -- skip
 
-        decisions.append(decision)
+        decisions.append(d)
         tag = {"EXCLUDE": "[EXCLUDE]", "KEEP": "[KEEP]", "FLAG_REVIEW": "[FLAG]"}
-        print(f"  {tag.get(decision['action'], '[?]')} {month_label}: {decision['reason']}")
+        logger.info("  %s %s: %s", tag.get(d["action"], "[?]"), label, d["reason"])
 
     if not decisions:
-        print("  [OK] All months within normal business range")
+        logger.info("  [OK] All periods within normal range")
 
     return decisions
 
 
 # =============================================================================
-# 6. RECONCILIATION CHECKS
+# 7. RECONCILIATION CHECKS
 # =============================================================================
 
 def reconciliation_checks(monthly_df, investment_df=None, tolerance=0.05):
     """Validate roll-ups and cross-dataset consistency."""
-    print("\n[RECON] Reconciliation Checks...")
+    logger.info("Reconciliation Checks...")
     results = {}
     m = monthly_df.copy()
 
-    # Revenue roll-up: sum of category revenues vs total_gmv
-    rev_cols = [c for c in m.columns if c.startswith('Revenue_')]
-    if rev_cols and 'total_gmv' in m.columns:
-        sum_rev = m[rev_cols].sum(axis=1)
-        diff_pct = abs(sum_rev - m['total_gmv']) / m['total_gmv'] * 100
-        max_diff = diff_pct.max()
-        results['revenue_rollup_max_diff_pct'] = max_diff
-        if max_diff > tolerance * 100:
-            print(f"  [WARN] Revenue roll-up: Max diff = {max_diff:.2f}% "
-                  f"(tolerance: {tolerance*100}%)")
+    # Revenue roll-up
+    rev_cols = [c for c in m.columns if c.startswith("Revenue_")]
+    if rev_cols and "total_gmv" in m.columns:
+        diff = abs(m[rev_cols].sum(axis=1) - m["total_gmv"]) / m["total_gmv"] * 100
+        mx = diff.max()
+        results["revenue_rollup"] = mx
+        if mx > tolerance * 100:
+            logger.warning("  [WARN] Revenue roll-up max diff: %.2f%%", mx)
         else:
-            print(f"  [OK] Revenue roll-up valid (max diff: {max_diff:.2f}%)")
+            logger.info("  [OK] Revenue roll-up valid (max diff: %.2f%%)", mx)
 
     # Units roll-up
-    unit_cols = [c for c in m.columns if c.startswith('Units_') and c != 'total_Units']
-    if unit_cols and 'total_Units' in m.columns:
-        sum_units = m[unit_cols].sum(axis=1)
-        diff_pct = abs(sum_units - m['total_Units']) / m['total_Units'] * 100
-        max_diff = diff_pct.max()
-        results['units_rollup_max_diff_pct'] = max_diff
-        if max_diff > tolerance * 100:
-            print(f"  [WARN] Units roll-up: Max diff = {max_diff:.2f}%")
+    unit_cols = [c for c in m.columns if c.startswith("Units_") and c != "total_Units"]
+    if unit_cols and "total_Units" in m.columns:
+        diff = abs(m[unit_cols].sum(axis=1) - m["total_Units"]) / m["total_Units"] * 100
+        mx = diff.max()
+        results["units_rollup"] = mx
+        if mx > tolerance * 100:
+            logger.warning("  [WARN] Units roll-up max diff: %.2f%%", mx)
         else:
-            print(f"  [OK] Units roll-up valid (max diff: {max_diff:.2f}%)")
+            logger.info("  [OK] Units roll-up valid (max diff: %.2f%%)", mx)
 
-    # Investment roll-up: sum of channels vs Total.Investment
-    channels = _get_channel_cols(m)
-    if channels and 'Total.Investment' in m.columns:
-        ch_sum = m[channels].apply(pd.to_numeric, errors='coerce').sum(axis=1)
-        total_inv = pd.to_numeric(m['Total.Investment'], errors='coerce')
-        diff_pct = abs(ch_sum - total_inv) / total_inv * 100
-        max_diff = diff_pct.max()
-        results['investment_rollup_max_diff_pct'] = max_diff
-        if max_diff > tolerance * 100:
-            print(f"  [WARN] Investment roll-up: Max diff = {max_diff:.2f}%")
-            bad_mask = diff_pct > tolerance * 100
-            if 'Date' in m.columns:
-                for idx in m[bad_mask].index:
-                    print(f"         {m.loc[idx, 'Date'].strftime('%b-%Y')}: "
-                          f"{diff_pct.loc[idx]:.1f}% off")
+    # Investment roll-up
+    channels = get_channel_cols(m)
+    if channels and "Total.Investment" in m.columns:
+        ch_sum = m[channels].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+        total = pd.to_numeric(m["Total.Investment"], errors="coerce")
+        diff = abs(ch_sum - total) / total * 100
+        mx = diff.max()
+        results["investment_rollup"] = mx
+        if mx > tolerance * 100:
+            logger.warning("  [WARN] Investment roll-up max diff: %.2f%%", mx)
         else:
-            print(f"  [OK] Investment roll-up valid (max diff: {max_diff:.2f}%)")
+            logger.info("  [OK] Investment roll-up valid (max diff: %.2f%%)", mx)
 
-    # Cross-validate with MediaInvestment.csv (redundancy check)
+    # Cross-validate with MediaInvestment.csv
     if investment_df is not None:
-        inv_total_col = _find_col(investment_df, ['Total Investment', 'Total.Investment'])
-        if inv_total_col and 'Total.Investment' in m.columns:
-            print("  [INFO] Cross-validating with MediaInvestment.csv...")
-            inv_total = pd.to_numeric(investment_df[inv_total_col], errors='coerce').sum()
-            monthly_total = pd.to_numeric(m['Total.Investment'], errors='coerce').sum()
-            if monthly_total > 0:
-                cross_diff = abs(inv_total - monthly_total) / monthly_total * 100
-                results['cross_dataset_diff_pct'] = cross_diff
-                if cross_diff > tolerance * 100:
-                    print(f"  [WARN] Cross-dataset diff: {cross_diff:.1f}%")
+        inv_col = find_col(investment_df, ["Total Investment", "Total.Investment"])
+        if inv_col and "Total.Investment" in m.columns:
+            logger.info("  [INFO] Cross-validating with MediaInvestment.csv...")
+            inv_sum = pd.to_numeric(investment_df[inv_col], errors="coerce").sum()
+            m_sum = pd.to_numeric(m["Total.Investment"], errors="coerce").sum()
+            if m_sum > 0:
+                cross = abs(inv_sum - m_sum) / m_sum * 100
+                results["cross_dataset"] = cross
+                if cross > tolerance * 100:
+                    logger.warning("  [WARN] Cross-dataset diff: %.1f%%", cross)
                 else:
-                    print(f"  [OK] Cross-dataset valid ({cross_diff:.1f}% diff)")
+                    logger.info("  [OK] Cross-dataset valid (%.1f%% diff)", cross)
 
     return results
 
 
 # =============================================================================
-# 7. VISUALIZATION
+# 8. VISUALIZATION
 # =============================================================================
 
 def plot_outlier_summary(df, outlier_flags, key_cols=None, save_dir=None):
-    """Visualize outlier detection results for monthly data."""
-    if save_dir is None:
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        save_dir = os.path.join(project_root, 'outputs', 'plots')
-
+    """Scatter plot with IQR bounds for key metrics."""
+    save_dir = save_dir or get_paths()["plots_dir"]
     if key_cols is None:
-        key_cols = ['total_gmv', 'Total.Investment', 'NPS']
-        key_cols = [c for c in key_cols if c in df.columns]
-
+        key_cols = ["total_gmv", "Total.Investment", "NPS"]
+    key_cols = [c for c in key_cols if c in df.columns]
     if not key_cols:
-        print("  [WARN] No key columns to plot")
         return
 
     n = len(key_cols)
     fig, axes = plt.subplots(1, n, figsize=(6 * n, 5))
     if n == 1:
         axes = [axes]
-    fig.suptitle('Outlier Detection Summary (Monthly)', fontsize=14, fontweight='bold')
+    fig.suptitle("Outlier Detection Summary", fontsize=14, fontweight="bold")
 
     for ax, col in zip(axes, key_cols):
-        vals = pd.to_numeric(df[col], errors='coerce')
+        vals = pd.to_numeric(df[col], errors="coerce")
         q1, q3 = vals.quantile(0.25), vals.quantile(0.75)
         iqr = q3 - q1
-        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
 
-        flag_col = f'{col}_outlier'
-        if flag_col in outlier_flags.columns:
-            colors = ['red' if f else '#2196F3' for f in outlier_flags[flag_col]]
-        else:
-            colors = ['#2196F3'] * len(vals)
+        flag_col = f"{col}_outlier"
+        colors = (["red" if f else "#2196F3" for f in outlier_flags[flag_col]]
+                  if flag_col in outlier_flags.columns
+                  else ["#2196F3"] * len(vals))
 
-        ax.scatter(range(len(vals)), vals, c=colors, s=80, edgecolors='white', zorder=3)
-        ax.axhline(y=upper, color='red', ls='--', alpha=0.5, label=f'Upper: {upper:.0f}')
-        ax.axhline(y=lower, color='red', ls='--', alpha=0.5, label=f'Lower: {lower:.0f}')
-        ax.axhline(y=vals.median(), color='green', ls='-', alpha=0.5, label='Median')
+        ax.scatter(range(len(vals)), vals, c=colors, s=80, edgecolors="white", zorder=3)
+        ax.axhline(y=hi, color="red", ls="--", alpha=0.5, label=f"Upper: {hi:.0f}")
+        ax.axhline(y=lo, color="red", ls="--", alpha=0.5, label=f"Lower: {lo:.0f}")
+        ax.axhline(y=vals.median(), color="green", ls="-", alpha=0.5, label="Median")
         ax.set_title(col)
         ax.legend(fontsize=8)
 
-    plt.tight_layout()
+    fig.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, 'outlier_summary.png'), dpi=150, bbox_inches='tight')
-    plt.show()
-    print(f"  [OK] Outlier summary plot saved to {save_dir}")
+    fig.savefig(os.path.join(save_dir, "outlier_summary.png"), dpi=150, bbox_inches="tight")
+    plt.close("all")
+    logger.info("  [OK] Outlier plot saved")
 
 
 # =============================================================================
-# 8. MASTER OUTLIER PIPELINE
+# 9. MASTER PIPELINE
 # =============================================================================
 
-def run_outlier_pipeline(data, save_dir=None):
+def run_outlier_pipeline(data, granularity="monthly", save_dir=None):
     """
-    Run the complete outlier detection and removal pipeline.
+    Run the complete outlier detection and cleaning pipeline.
 
     Args:
-        data: dict of DataFrames from load_all_data()
-        save_dir: where to save plots (auto-detects if None)
+        data:        dict of DataFrames from load_all_data()
+        granularity: 'weekly' or 'monthly' (affects which validations run)
+        save_dir:    plot output directory
 
     Returns:
-        clean_data: dict of cleaned DataFrames
-        full_log: list of all removal/flag decisions
-        assumptions: documented assumptions dict
+        (clean_data_dict, log_list, assumptions_dict)
     """
-    if save_dir is None:
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        save_dir = os.path.join(project_root, 'outputs', 'plots')
+    save_dir = save_dir or get_paths()["plots_dir"]
 
     print("=" * 70)
     print("[START] OUTLIER DETECTION & REMOVAL PIPELINE")
@@ -681,98 +749,84 @@ def run_outlier_pipeline(data, save_dir=None):
 
     print_assumptions()
 
-    # Step 1: Clean transactions
-    if 'transactions' in data:
-        clean_tx, tx_log = clean_transactions(
-            data['transactions'].copy(), "transactions (firstfile.csv)"
-        )
-        clean_data['transactions'] = clean_tx
-        full_log.extend(tx_log)
+    # --- Transactions ---
+    if "transactions" in data:
+        try:
+            df, log = clean_transactions(data["transactions"].copy(), "transactions (firstfile.csv)")
+            clean_data["transactions"] = df
+            full_log.extend(log)
+        except Exception as e:
+            logger.error("Transaction cleaning failed: %s", e)
+            clean_data["transactions"] = data["transactions"]
 
-    if 'sales' in data:
-        clean_sales, sales_log = clean_transactions(
-            data['sales'].copy(), "sales (Sales.csv)"
-        )
-        clean_data['sales'] = clean_sales
-        full_log.extend(sales_log)
+    if "sales" in data:
+        try:
+            df, log = clean_transactions(data["sales"].copy(), "sales (Sales.csv)")
+            clean_data["sales"] = df
+            full_log.extend(log)
+        except Exception as e:
+            logger.error("Sales cleaning failed: %s", e)
+            clean_data["sales"] = data["sales"]
 
-    # Step 2: Clean monthly data
-    if 'monthly' in data:
-        clean_monthly_df, monthly_log, validation = clean_monthly(
-            data['monthly'].copy()
-        )
-        clean_data['monthly'] = clean_monthly_df
-        full_log.extend(monthly_log)
+    # --- Monthly ---
+    if "monthly" in data:
+        try:
+            df, log, validation = clean_monthly(data["monthly"].copy())
+            clean_data["monthly"] = df
+            full_log.extend(log)
+        except Exception as e:
+            logger.error("Monthly cleaning failed: %s", e)
+            clean_data["monthly"] = data["monthly"]
 
-        # Step 3: Statistical outlier detection (monthly)
-        key_metric_cols = ['total_gmv', 'total_Units', 'total_Discount', 'NPS']
-        key_metric_cols = [c for c in key_metric_cols if c in clean_monthly_df.columns]
-        channels = _get_channel_cols(clean_monthly_df)
-        detect_cols = key_metric_cols + channels
+        # Statistical outlier detection on monthly
+        try:
+            key_cols = ["total_gmv", "total_Units", "total_Discount", "NPS"]
+            key_cols = [c for c in key_cols if c in clean_data["monthly"].columns]
+            channels = get_channel_cols(clean_data["monthly"])
+            detect_cols = key_cols + channels
 
-        iqr_flags, iqr_summary = detect_outliers_iqr(
-            clean_monthly_df, columns=detect_cols
-        )
-        zscore_flags, zscore_summary = detect_outliers_zscore(
-            clean_monthly_df, columns=detect_cols, threshold=2.5
-        )
+            iqr_flags, _ = detect_outliers_iqr(clean_data["monthly"], detect_cols)
+            detect_outliers_zscore(clean_data["monthly"], detect_cols)
 
-        # Step 4: Business context review
-        special_sales = data.get('special_sales', None)
-        decisions = business_context_review(clean_monthly_df, special_sales)
+            # Business context
+            ss = data.get("special_sales")
+            business_context_review(clean_data["monthly"], ss)
 
-        # Step 5: Reconciliation
-        investment = data.get('investment', None)
-        recon = reconciliation_checks(clean_monthly_df, investment)
+            # Reconciliation
+            inv = data.get("investment")
+            reconciliation_checks(clean_data["monthly"], inv)
 
-        # Step 6: Visualize
-        plot_outlier_summary(clean_monthly_df, iqr_flags, save_dir=save_dir)
+            # Plot
+            plot_outlier_summary(clean_data["monthly"], iqr_flags, save_dir=save_dir)
+        except Exception as e:
+            logger.error("Monthly outlier detection failed: %s", e)
 
-    # Pass through other datasets unchanged
-    for key in ['special_sales', 'nps', 'products', 'investment']:
+    # --- Pass-through datasets ---
+    for key in ["special_sales", "nps", "products", "investment"]:
         if key in data and key not in clean_data:
             clean_data[key] = data[key]
 
-    # Summary
+    # --- Summary ---
     print("\n" + "=" * 70)
     print("[DONE] OUTLIER PIPELINE COMPLETE")
     print("=" * 70)
-
-    total_actions = len(full_log)
-    print(f"\n  Total cleaning actions: {total_actions}")
-    print(f"  Datasets cleaned:       {list(clean_data.keys())}")
-
+    print(f"\n  Cleaning actions: {len(full_log)}")
+    print(f"  Datasets: {list(clean_data.keys())}")
     if full_log:
-        print("\n  Cleaning Log:")
+        print("\n  Log:")
         for entry in full_log:
-            removed = entry.get('rows_removed', entry.get('rows_affected', entry.get('rows_flagged', 0)))
+            removed = entry.get("rows_removed", entry.get("rows_affected",
+                     entry.get("rows_flagged", 0)))
             print(f"    - [{entry['step']}] {entry['reason']} ({removed} rows)")
 
     return clean_data, full_log, ASSUMPTIONS
 
 
 # =============================================================================
-# HELPERS
-# =============================================================================
-
-def _find_col(df, candidates):
-    """Find the first matching column name from a list of candidates."""
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
-
-def _get_channel_cols(df):
-    """Get media channel columns present in the dataframe."""
-    return [c for c in MEDIA_CHANNELS if c in df.columns]
-
-
-# =============================================================================
 # RUN
 # =============================================================================
+
 if __name__ == "__main__":
     from eda_pipeline import load_all_data
-
     data = load_all_data()
     clean_data, log, assumptions = run_outlier_pipeline(data)
