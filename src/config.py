@@ -92,10 +92,17 @@ MEDIA_CHANNELS = [
 
 CHANNEL_GROUPS = {
     "traditional":          ["TV", "Sponsorship"],
-    "digital_performance":  ["Online.marketing", "Affiliates", "SEM"],
-    "digital_brand":        ["Digital", "Content.Marketing"],
+    "digital_performance":  ["Online.marketing", "Affiliates"],
+    "digital_brand":        ["Digital", "Content.Marketing", "SEM"],
     "other":                ["Radio", "Other"],
 }
+# Grouping rationale (from EDA correlation analysis):
+#   - Online.marketing ↔ Affiliates: r=0.99 → must group
+#   - Digital ↔ Content.Marketing ↔ SEM: r=0.90-0.97 → group together
+#   - SEM moved from digital_performance to digital_brand based on
+#     correlation evidence (SEM↔Digital r=0.97, SEM↔Content.Mkt r=0.96)
+#   - Radio, Other: both strongly negative with GMV (r=-0.95, -0.96)
+#   - TV, Sponsorship: positive, moderate cross-correlation (r=0.55)
 
 # Log feature name -> raw column name mapping
 LOG_TO_RAW_MAP = {
@@ -133,6 +140,14 @@ MODEL_SETTINGS = {
         "ordinality": 0.25,
         "vif": 0.15,
     },
+    # Quality gate thresholds used by QualityEvaluator (agent loop)
+    "quality_thresholds": {
+        "min_r2": 0.50,            # Weekly R² floor — below triggers RETRY
+        "min_adj_r2": 0.45,        # Adjusted R² floor
+        "max_vif": 50,             # Maximum acceptable VIF for best model
+        "min_models_passed": 5,    # Minimum successful model specs
+        "min_ordinality_rate": 0.5, # Fraction of convergence-confirmed channels
+    },
 }
 
 # =============================================================================
@@ -140,19 +155,19 @@ MODEL_SETTINGS = {
 # =============================================================================
 
 LLM_CONFIG = {
-    "endpoint": "https://zs-eu1-ail-agentics-openai-team10.openai.azure.com/",
-    "api_version": "2024-12-01-preview",
-    "deployment": "gpt-4.1",
-    "embedding_deployment": "text-embedding-3-small",
-    "api_key_env": "AZURE_OPENAI_API_KEY",
+    "endpoint": os.environ.get("AZURE_OPENAI_ENDPOINT"),
+    "api_version": os.environ.get("AZURE_OPENAI_API_VERSION"),
+    "deployment": os.environ.get("AZURE_OPENAI_DEPLOYMENT"),
+    "embedding_deployment": os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT"),
+    "api_key": os.environ.get("AZURE_OPENAI_API_KEY"),
 }
 
 
 def get_llm_api_key():
     """Return the LLM API key from the environment, or None."""
-    key = os.getenv(LLM_CONFIG["api_key_env"])
+    key = LLM_CONFIG["api_key"]
     if not key:
-        logger.warning(f"{LLM_CONFIG['api_key_env']} not set in environment")
+        logger.warning("AZURE_OPENAI_API_KEY not set in environment")
     return key
 
 # =============================================================================

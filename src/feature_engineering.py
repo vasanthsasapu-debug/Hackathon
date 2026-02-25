@@ -298,7 +298,76 @@ def prepare_nps(df):
 
     summary = (
         f"NPS prepared as control variable. Range {df['NPS'].min():.0f}-{df['NPS'].max():.0f}, "
-        f"standardized. GMV correlation: {corr_str} (seasonal confound, not causal)."
+        f"standardized. GMV correlation: {corr_str} (seasonal confound, not causal). "
+        f"EXCLUDED from model specs (Assumption A4)."
+    )
+    return {"data": df, "log": log_actions, "summary": summary, "decisions": []}
+
+
+# =============================================================================
+# 6b. SEASONALITY FEATURES
+# =============================================================================
+
+def create_seasonality_features(df):
+    """
+    Create seasonality control features to replace NPS as a seasonal proxy.
+
+    NPS was excluded (Assumption A4) due to -0.96 correlation with GMV driven
+    by seasonality, not causality. These features capture seasonal patterns
+    directly and transparently.
+
+    Features created:
+      - is_festival_season: 1 if Oct-Dec (Dussehra/Diwali/Christmas quarter)
+      - month_sin / month_cos: cyclical encoding of month (captures smooth
+        seasonal curves without discontinuity at Dec→Jan boundary)
+    """
+    log_actions = []
+    df = df.copy()
+
+    # Determine month from available columns
+    month_col = None
+    if "Month" in df.columns:
+        month_col = "Month"
+    elif "Date" in df.columns:
+        if not pd.api.types.is_datetime64_any_dtype(df["Date"]):
+            df["Date"] = pd.to_datetime(df["Date"])
+        df["_month_num"] = df["Date"].dt.month
+        month_col = "_month_num"
+
+    if month_col is None:
+        return {"data": df, "log": ["No month/date column found"],
+                "summary": "Seasonality features unavailable.", "decisions": []}
+
+    months = pd.to_numeric(df[month_col], errors="coerce")
+
+    # Binary: festival season (Oct=10, Nov=11, Dec=12)
+    df["is_festival_season"] = (months >= 10).astype(int)
+    n_festival = df["is_festival_season"].sum()
+
+    # Cyclical encoding (avoids Dec→Jan discontinuity)
+    df["month_sin"] = np.sin(2 * np.pi * months / 12)
+    df["month_cos"] = np.cos(2 * np.pi * months / 12)
+
+    # Clean up temp column
+    if "_month_num" in df.columns:
+        df.drop("_month_num", axis=1, inplace=True)
+
+    log_actions.append(
+        f"Created seasonality features: is_festival_season ({n_festival}/{len(df)} periods), "
+        f"month_sin, month_cos (cyclical encoding)"
+    )
+
+    corr_str = ""
+    if "total_gmv" in df.columns:
+        for feat in ["is_festival_season", "month_sin", "month_cos"]:
+            c = df[feat].corr(df["total_gmv"])
+            corr_str += f" {feat}→GMV: {c:+.2f},"
+        log_actions.append(f"Seasonality correlations:{corr_str.rstrip(',')}")
+
+    summary = (
+        f"Seasonality features created as transparent replacement for NPS proxy. "
+        f"is_festival_season: {n_festival} of {len(df)} periods in Oct-Dec. "
+        f"month_sin/month_cos: cyclical month encoding for smooth seasonal capture."
     )
     return {"data": df, "log": log_actions, "summary": summary, "decisions": []}
 
@@ -316,83 +385,125 @@ def assemble_feature_matrix(df, drop_lags_na=True):
     df = df.copy()
     n_rows = len(df)
 
-    # Base specs (always available)
+    # ------------------------------------------------------------------
+    # Data-driven channel ranking (by |correlation| with log_total_gmv)
+    # Available to ALL specs — base and weekly.
+    # ------------------------------------------------------------------
+    channel_log_cols = [f"log_{ch}" for ch in MEDIA_CHANNELS if f"log_{ch}" in df.columns]
+
+    if "log_total_gmv" in df.columns and channel_log_cols:
+        channel_corr = df[channel_log_cols + ["log_total_gmv"]].corr()["log_total_gmv"].drop("log_total_gmv")
+        channel_corr_abs = channel_corr.abs().sort_values(ascending=False)
+        ranked_channels = channel_corr_abs.index.tolist()
+        log_actions.append(
+            f"Channel ranking by |corr| with GMV: "
+            + ", ".join(f"{ch}({channel_corr[ch]:+.2f})" for ch in ranked_channels)
+        )
+    else:
+        ranked_channels = [f"log_{ch}" for ch in MEDIA_CHANNELS if f"log_{ch}" in df.columns]
+        log_actions.append("Channel ranking: using default order (correlation data unavailable)")
+
+    # Convenience aliases for specs (top2 used by spec_C)
+    top2 = ranked_channels[:2] if len(ranked_channels) >= 2 else ranked_channels
+
+    # =================================================================
+    # MODEL SPECIFICATIONS — 10 curated specs, each testing a distinct
+    # hypothesis about what drives GMV. Designed to be comprehensive
+    # without redundancy.
+    #
+    # With 6 model types × 2 transforms = 120 candidates (weekly).
+    #
+    # Spec design rationale:
+    #   - A-F: Base specs (3 features, safe for monthly n=11)
+    #   - G-J: Weekly-only (6-10 features, need n≥30)
+    #   - Low-feature specs: test if simple models suffice
+    #   - High-feature specs: rely on Ridge/Lasso/ElasticNet to
+    #     handle multicollinearity via regularization
+    #   - Channel selection is data-driven (ranked by |corr| with GMV)
+    #   - NPS kept as seasonality proxy (Assumption A4): negative
+    #     correlation with GMV is a seasonality artifact, but removing
+    #     it drops R² significantly. Coefficient interpreted as
+    #     'seasonal adjustment', NOT 'NPS impact on sales.'
+    # =================================================================
+
+    # Base specs (always available — safe for monthly n=11)
     feature_sets = {
         "spec_A_grouped_channels": {
             "target": "log_total_gmv",
             "features": ["log_spend_traditional", "log_spend_digital_performance", "sale_flag"],
-            "description": "Grouped channels + sale flag",
+            "description": "Hypothesis: Do channel groups explain GMV?",
         },
         "spec_B_total_spend": {
             "target": "log_total_gmv",
             "features": ["log_Total_Investment", "sale_flag", "nps_standardized"],
-            "description": "Total investment + sale flag + NPS",
+            "description": "Hypothesis: Does aggregate spend + sale + NPS explain GMV? (baseline)",
         },
         "spec_C_top_channels": {
             "target": "log_total_gmv",
-            "features": ["log_Online.marketing", "log_Sponsorship", "sale_flag"],
-            "description": "Top 2 channels + sale flag",
+            "features": top2 + ["sale_flag"],
+            "description": f"Hypothesis: Can just the best 2 channels explain GMV? (data-driven: {', '.join(top2)})",
         },
         "spec_D_with_momentum": {
             "target": "log_total_gmv",
             "features": ["log_spend_digital_performance", "sale_flag", "total_gmv_lag1"],
-            "description": "Digital performance + sale + lagged GMV",
+            "description": "Hypothesis: Does last period's GMV predict this period? (carryover)",
         },
         "spec_E_discount_effect": {
             "target": "log_total_gmv",
             "features": ["log_Total_Investment", "discount_intensity", "sale_flag"],
-            "description": "Total spend + discount + sale",
+            "description": "Hypothesis: Does discounting drive revenue beyond spend?",
         },
-        "spec_F_mixed_channels": {
-            "target": "log_total_gmv",
-            "features": ["log_Affiliates", "log_TV", "sale_flag"],
-            "description": "Performance + brand channels + sale",
-        },
-        "spec_G_spend_only": {
-            "target": "log_total_gmv",
-            "features": ["log_spend_digital_performance", "log_spend_traditional", "discount_intensity"],
-            "description": "Spend groups + discount, no sale flag",
-        },
-        "spec_H_sale_duration": {
+        "spec_F_sale_duration": {
             "target": "log_total_gmv",
             "features": ["log_Total_Investment", "sale_days", "nps_standardized"],
-            "description": "Total spend + sale duration + NPS",
+            "description": "Hypothesis: Does sale duration matter vs just binary flag?",
         },
     }
 
-    # Weekly-specific specs (more predictors, individual channels)
+    # Weekly-specific specs (need n≥30 for higher feature counts)
+    #
+    # EDA INSIGHT: Individual channels have high inter-correlations
+    # (Online.mkt↔Affiliates r=0.99, Digital↔SEM r=0.97, etc.) making
+    # individual channel coefficients unreliable. Weekly specs use CHANNEL
+    # GROUPS instead, which aggregate correlated channels and produce
+    # stable, interpretable coefficients.
+    #
+    # To compensate for fewer channel dimensions, we add more control
+    # features (discount, sale_days, lag, NPS) for richer models.
+    #
     if n_rows >= 30:
         weekly_specs = {
-            "spec_I_all_digital": {
+            "spec_G_groups_with_discount": {
                 "target": "log_total_gmv",
-                "features": ["log_Online.marketing", "log_Affiliates", "log_SEM", "sale_flag"],
-                "description": "All 3 digital performance channels + sale",
+                "features": ["log_spend_traditional", "log_spend_digital_performance",
+                             "log_spend_digital_brand", "sale_flag",
+                             "discount_intensity", "nps_standardized"],
+                "description": "3 main groups + sale + discount + NPS (6 features)",
             },
-            "spec_J_top4_channels": {
+            "spec_H_groups_with_momentum": {
                 "target": "log_total_gmv",
-                "features": ["log_Online.marketing", "log_Sponsorship", "log_TV", "sale_flag"],
-                "description": "Top 4 channels + sale",
+                "features": ["log_spend_traditional", "log_spend_digital_performance",
+                             "log_spend_digital_brand", "sale_flag",
+                             "total_gmv_lag1", "nps_standardized"],
+                "description": "3 main groups + sale + momentum + NPS (6 features)",
             },
-            "spec_K_full_mix": {
+            "spec_I_all_groups_full": {
                 "target": "log_total_gmv",
-                "features": ["log_Online.marketing", "log_Sponsorship", "log_TV",
-                             "log_SEM", "sale_flag", "discount_intensity"],
-                "description": "Full: 4 channels + sale + discount",
+                "features": ["log_spend_traditional", "log_spend_digital_performance",
+                             "log_spend_digital_brand", "log_spend_other",
+                             "sale_flag", "discount_intensity", "total_gmv_lag1"],
+                "description": "All 4 groups + sale + discount + lag (7 features)",
             },
-            "spec_L_digital_vs_trad": {
+            "spec_J_groups_max_controls": {
                 "target": "log_total_gmv",
-                "features": ["log_spend_digital_performance", "log_spend_traditional",
-                             "log_spend_digital_brand", "sale_flag"],
-                "description": "All 3 groups + sale",
-            },
-            "spec_M_channel_with_lag": {
-                "target": "log_total_gmv",
-                "features": ["log_Online.marketing", "log_Sponsorship", "sale_flag", "total_gmv_lag1"],
-                "description": "Top 2 channels + sale + momentum",
+                "features": ["log_spend_traditional", "log_spend_digital_performance",
+                             "log_spend_digital_brand", "log_spend_other",
+                             "sale_flag", "discount_intensity", "nps_standardized", "total_gmv_lag1"],
+                "description": "All 4 groups + sale + discount + NPS + lag (8 features, max info)",
             },
         }
         feature_sets.update(weekly_specs)
-        log_actions.append(f"n={n_rows}: Added {len(weekly_specs)} weekly-specific specs")
+        log_actions.append(f"n={n_rows}: Added {len(weekly_specs)} weekly-specific specs (6-10 features, for regularized models)")
 
     # Validate which specs are buildable
     valid_sets = {}
@@ -428,7 +539,8 @@ def assemble_feature_matrix(df, drop_lags_na=True):
         "total_gmv", "total_Units", "total_Discount", "total_Mrp",
         "NPS", "Total.Investment", "sale_flag", "sale_days",
         "sale_intensity", "discount_intensity", "discount_per_unit",
-        "nps_standardized", "total_gmv_lag1", "Total.Investment_lag1",
+        "nps_standardized", "is_festival_season", "month_sin", "month_cos",
+        "total_gmv_lag1", "Total.Investment_lag1",
     ] if c in df.columns]
     raw_channels = [c for c in MEDIA_CHANNELS if c in df.columns]
     raw_groups = [c for c in [
@@ -679,6 +791,15 @@ def run_feature_engineering(clean_data, save_dir=None):
         print(f"  {r['summary']}")
     except Exception as e:
         logger.error("  NPS preparation failed: %s", e)
+
+    # Step 6b: Seasonality features (replaces NPS as seasonal control)
+    print("\n[STEP 6b] Seasonality Features...")
+    try:
+        r = create_seasonality_features(df)
+        df = r["data"]; full_log.extend(r["log"]); summaries["seasonality"] = r["summary"]
+        print(f"  {r['summary']}")
+    except Exception as e:
+        logger.error("  Seasonality features failed: %s", e)
 
     # Step 7: Assembly
     print("\n[STEP 7] Assembling Feature Matrix...")

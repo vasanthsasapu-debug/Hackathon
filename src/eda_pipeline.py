@@ -31,7 +31,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from config import (
-    DATA_FILES, MEDIA_CHANNELS, get_paths, get_channel_cols, find_col, logger
+    DATA_FILES, MEDIA_CHANNELS, CHANNEL_GROUPS, get_paths, get_channel_cols, find_col, logger
 )
 
 plt.rcParams["figure.figsize"] = (14, 6)
@@ -468,6 +468,100 @@ def correlation_analysis(monthly_df, save_dir=None):
             direction = "positive" if val > 0 else "negative"
             print(f"    {ch:25s} -> {val:+.3f} ({strength}, {direction})")
 
+        # === FEATURE SIGN & GROUPING SUMMARY ===
+        # This output helps decide ordinality rules and channel groupings
+        print(f"\n  {'='*60}")
+        print(f"  FEATURE-GMV CORRELATION SUMMARY (for modeling decisions)")
+        print(f"  {'='*60}")
+
+        pos_channels = [ch for ch in channels if corr.loc[ch, target] > 0.1]
+        neg_channels = [ch for ch in channels if corr.loc[ch, target] < -0.1]
+        weak_channels = [ch for ch in channels if abs(corr.loc[ch, target]) <= 0.1]
+
+        print(f"\n  POSITIVE correlation with GMV (ordinality: coef should be >= 0):")
+        for ch in sorted(pos_channels, key=lambda c: corr.loc[c, target], reverse=True):
+            print(f"    {ch:25s} -> {corr.loc[ch, target]:+.3f}")
+
+        print(f"\n  NEGATIVE correlation with GMV (ordinality: negative coef is OK):")
+        for ch in sorted(neg_channels, key=lambda c: corr.loc[c, target]):
+            print(f"    {ch:25s} -> {corr.loc[ch, target]:+.3f}")
+
+        if weak_channels:
+            print(f"\n  WEAK/AMBIGUOUS correlation (|corr| <= 0.1):")
+            for ch in weak_channels:
+                print(f"    {ch:25s} -> {corr.loc[ch, target]:+.3f}")
+
+        # Inter-channel correlations (high = multicollinearity risk)
+        print(f"\n  HIGH INTER-CHANNEL CORRELATIONS (|r| > 0.85 = grouping candidates):")
+        high_pairs = []
+        for i, ch1 in enumerate(channels):
+            for ch2 in channels[i+1:]:
+                r = corr.loc[ch1, ch2]
+                if abs(r) > 0.85:
+                    high_pairs.append((ch1, ch2, r))
+        if high_pairs:
+            for ch1, ch2, r in sorted(high_pairs, key=lambda x: abs(x[2]), reverse=True):
+                print(f"    {ch1:20s} <-> {ch2:20s}  r={r:+.3f}")
+        else:
+            print(f"    None found")
+
+        # Group-level correlations (checks if channel groups are also correlated)
+        group_cols = {}
+        for gname, gchannels in CHANNEL_GROUPS.items():
+            present = [ch for ch in gchannels if ch in df.columns]
+            if present:
+                group_cols[f"spend_{gname}"] = df[present].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+
+        if len(group_cols) >= 2:
+            import pandas as _pd
+            group_df = _pd.DataFrame(group_cols)
+            if target in df.columns:
+                group_df[target] = pd.to_numeric(df[target], errors="coerce")
+
+            group_corr = group_df.corr()
+            print(f"\n  CHANNEL GROUP CORRELATIONS (for spec validation):")
+            print(f"  {'':20s}", end="")
+            for g in group_cols:
+                print(f"  {g[6:]:>16s}", end="")
+            if target in group_df.columns:
+                print(f"  {'GMV':>8s}", end="")
+            print()
+
+            for g1 in group_cols:
+                print(f"  {g1[6:]:20s}", end="")
+                for g2 in group_cols:
+                    print(f"  {group_corr.loc[g1, g2]:>16.3f}", end="")
+                if target in group_df.columns:
+                    print(f"  {group_corr.loc[g1, target]:>8.3f}", end="")
+                print()
+
+            # Flag high group-level correlations
+            high_group_pairs = []
+            group_names = list(group_cols.keys())
+            for i, g1 in enumerate(group_names):
+                for g2 in group_names[i+1:]:
+                    r = group_corr.loc[g1, g2]
+                    if abs(r) > 0.7:
+                        high_group_pairs.append((g1, g2, r))
+            if high_group_pairs:
+                print(f"\n  WARNING: High group-level correlations (|r| > 0.7):")
+                for g1, g2, r in sorted(high_group_pairs, key=lambda x: abs(x[2]), reverse=True):
+                    print(f"    {g1[6:]:20s} <-> {g2[6:]:20s}  r={r:+.3f}")
+                print(f"    → Consider combining these groups or using Total.Investment instead")
+            else:
+                print(f"\n  [OK] Group-level correlations are manageable (all |r| <= 0.7)")
+
+        # NPS correlation context
+        if "NPS" in corr.index:
+            nps_gmv = corr.loc["NPS", target]
+            print(f"\n  NPS -> GMV: {nps_gmv:+.3f} (used as seasonality proxy, not causal)")
+            print(f"  NPS channel correlations:")
+            for ch in channels:
+                if ch in corr.index:
+                    print(f"    NPS <-> {ch:20s}  r={corr.loc['NPS', ch]:+.3f}")
+
+        print(f"  {'='*60}")
+
     _save_plot(fig, save_dir, "correlation_analysis.png")
     return corr
 
@@ -633,9 +727,14 @@ def nps_revenue_analysis(monthly_df, save_dir=None):
 # 12. MASTER EDA RUNNER
 # =============================================================================
 
-def run_full_eda(data_dir=None, save_dir=None):
+def run_full_eda(data_dir=None, save_dir=None, data=None):
     """
     Run the complete EDA pipeline.
+
+    Args:
+        data_dir:  path to data directory (used only if data is None)
+        save_dir:  path to save plots
+        data:      pre-loaded data dict (if provided, skips loading)
 
     Returns:
         (data, classifications, issues, corr_matrix)
@@ -649,8 +748,12 @@ def run_full_eda(data_dir=None, save_dir=None):
     print("[START] EDA PIPELINE")
     print("=" * 60)
 
-    print("\n[STEP 1] Loading Data...")
-    data = load_all_data(data_dir)
+    if data is None:
+        print("\n[STEP 1] Loading Data...")
+        data = load_all_data(data_dir)
+    else:
+        print("\n[STEP 1] Using pre-loaded data (skipping reload)...")
+
     if not data:
         logger.error("No data loaded")
         return None, None, None, None

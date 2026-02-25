@@ -72,15 +72,24 @@ ASSUMPTIONS = {
             "cleanly in regression without artificial imputation."
         ),
     },
-    "A4_NPS_VARIATION": {
-        "description": "NPS ranges 44-60 across 12 months.",
-        "decision": "KEEP raw NPS values. Not outliers.",
+    "A4_NPS_SEASONALITY_PROXY": {
+        "description": (
+            "NPS ranges 44-60 across 12 months and has -0.96 correlation with GMV. "
+            "Negatively correlated with all 9 media channels."
+        ),
+        "decision": (
+            "KEEP NPS in model as a seasonality proxy. Do NOT interpret the "
+            "coefficient as 'customer satisfaction impact on revenue.'"
+        ),
         "reasoning": (
-            "This range is normal for a growing e-commerce platform. "
-            "NPS shows strong negative correlation with GMV (-0.96), but "
-            "this is confounded by seasonality -- high-demand months have "
-            "lower NPS due to delivery pressure. NPS is a control variable, "
-            "not a causal driver in this context."
+            "The strong negative NPS-GMV correlation is a seasonality artifact, not causal. "
+            "High-volume sale periods (Diwali, Eid) attract deal-seeking buyers who rate "
+            "their experience lower (delivery delays, stock-outs), driving NPS down when "
+            "GMV is highest. However, removing NPS drops R² significantly because it was "
+            "absorbing seasonal variance that sale_flag alone cannot capture. NPS is retained "
+            "as a transparent seasonality control — its coefficient should be read as "
+            "'seasonal adjustment' not 'NPS effect on sales.' Revisit with 24+ months of "
+            "data where proper seasonal dummies can replace it."
         ),
     },
     "A5_SEASONAL_PEAKS": {

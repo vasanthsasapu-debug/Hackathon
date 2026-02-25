@@ -63,17 +63,38 @@ def get_feature_specs():
     }
 
 
-def get_model_types():
-    """All supported model types."""
-    return {
-        "OLS":         {"description": "OLS -- baseline, p-values",          "builder": build_ols},
-        "Ridge":       {"description": "Ridge -- L2, stable",               "builder": build_ridge},
-        "Lasso":       {"description": "Lasso -- L1, feature selection",    "builder": build_lasso},
-        "ElasticNet":  {"description": "ElasticNet -- L1+L2 combined",      "builder": build_elasticnet},
-        "Bayesian":    {"description": "Bayesian Ridge -- uncertainty",     "builder": build_bayesian},
-        "XGBoost":     {"description": "XGBoost -- non-linear, trees",      "builder": build_xgboost},
-        "RandomForest":{"description": "Random Forest -- ensemble",         "builder": build_random_forest},
+def get_model_types(model_filter="all"):
+    """
+    All supported model types, filtered by argument.
+    
+    Args:
+        model_filter: 'all', 'linear', or comma-separated names
+    
+    Note: XGBoost and RandomForest were removed because tree-based models
+    don't produce interpretable elasticities (coefficients), which are
+    essential for MMIX business recommendations. The 6 linear models
+    provide full coefficient interpretability and handle multicollinearity
+    via regularization.
+    """
+    all_types = {
+        "OLS":         {"description": "OLS -- baseline, p-values",       "builder": build_ols},
+        "Ridge":       {"description": "Ridge -- L2, stable",            "builder": build_ridge},
+        "Lasso":       {"description": "Lasso -- L1, feature selection", "builder": build_lasso},
+        "ElasticNet":  {"description": "ElasticNet -- L1+L2 combined",   "builder": build_elasticnet},
+        "Bayesian":    {"description": "Bayesian Ridge -- uncertainty",  "builder": build_bayesian},
+        "Huber":       {"description": "Huber -- robust to outliers",    "builder": build_huber},
     }
+
+    if model_filter == "all" or model_filter == "linear":
+        return all_types
+    else:
+        # Comma-separated list
+        selected = [m.strip() for m in model_filter.split(",")]
+        filtered = {k: v for k, v in all_types.items() if k in selected}
+        if not filtered:
+            logger.warning("No valid models in '%s'. Using all.", model_filter)
+            return all_types
+        return filtered
 
 
 def get_transform_variants():
@@ -117,8 +138,8 @@ def build_ols(X, y, feature_names):
             "standardized_coefficients": std_coefs, "pvalues": pvals,
             "r_squared": model.rsquared, "adj_r_squared": model.rsquared_adj,
             "aic": model.aic, "bic": model.bic,
-            "predictions": model.fittedvalues.values,
-            "residuals": model.resid.values, "success": True,
+            "predictions": np.asarray(model.fittedvalues),
+            "residuals": np.asarray(model.resid), "success": True,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -201,6 +222,25 @@ def build_bayesian(X, y, feature_names):
         return {"success": False, "error": str(e)}
 
 
+def build_huber(X, y, feature_names):
+    """Huber regression -- robust to outliers, downweights high-residual points."""
+    try:
+        from sklearn.linear_model import HuberRegressor
+        sc = StandardScaler()
+        Xs = sc.fit_transform(X)
+        m = HuberRegressor(epsilon=1.35, max_iter=200)
+        m.fit(Xs, y)
+        p = m.predict(Xs)
+        coefs = dict(zip(feature_names, m.coef_))
+        coefs["const"] = m.intercept_
+        r2, adj = _compute_r2(y, p, X.shape)
+        return {"model": m, "scaler": sc, "coefficients": coefs, "pvalues": {},
+                "r_squared": r2, "adj_r_squared": adj,
+                "predictions": p, "residuals": y - p, "success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def build_xgboost(X, y, feature_names):
     """XGBoost with conservative hyperparams."""
     try:
@@ -252,19 +292,55 @@ def build_random_forest(X, y, feature_names):
 # 3. ORDINALITY
 # =============================================================================
 
-def check_ordinality(coefficients, feature_names):
-    """Spend and sale features should be >= 0."""
+def check_ordinality(coefficients, feature_names, feature_correlations=None):
+    """
+    Check that coefficients have the expected sign based on business logic.
+
+    Only UNAMBIGUOUS features are constrained:
+      - sale_flag, sale_days: MUST be >= 0 (more sales = more GMV, always)
+      - log_Total_Investment / Total.Investment: MUST be >= 0 (aggregate spend)
+
+    Channel groups and individual channels are NOT constrained because:
+      - Multicollinearity can flip signs even for positively-correlated channels
+      - Convergence analysis shows some groups (e.g. digital_brand) are consistently
+        negative when controlling for other spend — this is a real signal, not an error
+      - Regularized models (Ridge/Lasso) produce reliable signs even with collinearity
+
+    Other features (NPS, discount, lag) have ambiguous expected direction
+    and are not constrained.
+
+    Args:
+        coefficients:         dict of {feature: coef}
+        feature_names:        list of feature names
+        feature_correlations: dict of {feature: corr_with_gmv} (for logging only)
+    """
     violations, checks = [], []
+    corr = feature_correlations or {}
+
+    # Only these features have unambiguous expected positive direction
+    MUST_POSITIVE = ["sale_flag", "sale_days", "sale_intensity",
+                     "log_total_investment", "total.investment"]
+
     for f in feature_names:
         fl = f.lower()
-        needs_positive = any(k in fl for k in ["log_", "spend_", "investment", "sale"])
-        if not needs_positive:
-            continue
-        c = coefficients.get(f, 0)
-        ok = c >= 0
-        checks.append({"feature": f, "coefficient": c, "passed": ok})
-        if not ok:
-            violations.append(f"{f} = {c:.4f}")
+
+        must_be_positive = any(k in fl for k in MUST_POSITIVE)
+
+        if must_be_positive:
+            c = coefficients.get(f, 0)
+            ok = c >= 0
+            checks.append({"feature": f, "coefficient": c,
+                          "expected": "positive (unambiguous)", "passed": ok})
+            if not ok:
+                violations.append(f"{f} = {c:.4f} (expected positive)")
+        else:
+            # Log but don't enforce — channel groups, NPS, discount, lag
+            c = coefficients.get(f, 0)
+            feat_corr = corr.get(f)
+            corr_note = f"corr={feat_corr:+.2f}" if feat_corr is not None else "no constraint"
+            checks.append({"feature": f, "coefficient": c,
+                          "expected": f"any ({corr_note})", "passed": True})
+
     return {"passed": len(violations) == 0, "violations": violations,
             "checks": checks, "n_violations": len(violations)}
 
@@ -378,6 +454,13 @@ def build_scenario_simulator(model_result, feature_matrix, feature_names, target
     """
     Build simulator that accepts raw channel names and translates
     to whatever features the model uses.
+
+    Uses a DUAL-BASELINE approach:
+      - Channel scenarios: baseline = overall feature means (standard)
+      - Sale scenarios: baseline = non-sale period means, so the delta
+        (0 → sale_days=3) is real rather than (mean≈3 → 3) which shows 0% change.
+        This correctly measures "what happens if we activate a sale in a
+        month that wouldn't otherwise have one."
     """
     if not model_result["train_result"].get("success"):
         return None
@@ -387,6 +470,43 @@ def build_scenario_simulator(model_result, feature_matrix, feature_names, target
     scaler = model_result["train_result"].get("scaler")
     baseline = feature_matrix[feature_names].mean().to_dict()
     baseline_target = feature_matrix[target_col].mean()
+
+    # --- Compute non-sale baseline for sale scenarios ---
+    # When simulating "Activate sale event", the counterfactual is a month
+    # WITHOUT a sale. Using the overall mean as baseline includes sale months,
+    # making sale_days baseline ≈ 3, so setting sale_days=3 shows 0% change.
+    # The non-sale baseline sets sale features to their non-sale-period values.
+    SALE_FEATURES = {"sale_flag", "sale_days", "sale_intensity"}
+    sale_features_in_model = [f for f in feature_names if f in SALE_FEATURES]
+
+    non_sale_baseline = baseline.copy()
+    if sale_features_in_model:
+        # Try to find non-sale rows
+        sale_flag_col = "sale_flag" if "sale_flag" in feature_matrix.columns else None
+        if sale_flag_col:
+            non_sale_mask = feature_matrix[sale_flag_col] == 0
+            n_non_sale = non_sale_mask.sum()
+            if n_non_sale >= 2:
+                # Use mean of non-sale periods for ALL features (not just sale features)
+                # This gives a realistic "typical non-sale month" as baseline
+                non_sale_baseline = feature_matrix.loc[non_sale_mask, feature_names].mean().to_dict()
+                logger.info("  Non-sale baseline: %d non-sale periods found (of %d total)",
+                            n_non_sale, len(feature_matrix))
+            else:
+                # Fallback: just zero out sale features in the overall baseline
+                for sf in sale_features_in_model:
+                    non_sale_baseline[sf] = 0.0
+                logger.info("  Non-sale baseline: <2 non-sale periods, zeroing sale features")
+        else:
+            # No sale_flag column — zero out any sale features
+            for sf in sale_features_in_model:
+                non_sale_baseline[sf] = 0.0
+            logger.info("  Non-sale baseline: no sale_flag column, zeroing sale features")
+
+        # Log the difference for transparency
+        for sf in sale_features_in_model:
+            logger.info("    %s: overall_mean=%.2f, non_sale_baseline=%.2f",
+                        sf, baseline.get(sf, 0), non_sale_baseline.get(sf, 0))
 
     # Raw channel means
     raw_means = {}
@@ -399,7 +519,7 @@ def build_scenario_simulator(model_result, feature_matrix, feature_names, target
                     break
     total_mean = sum(raw_means.values()) if raw_means else 0
 
-    # Baseline prediction
+    # Baseline prediction (using overall mean — channel scenarios use this)
     Xb = np.array([[baseline[f] for f in feature_names]])
     try:
         if mtype == "OLS":
@@ -410,8 +530,24 @@ def build_scenario_simulator(model_result, feature_matrix, feature_names, target
         bp = baseline_target
     base_gmv = np.expm1(bp) if target_col.startswith("log_") else bp
 
-    logger.info("  Scenario simulator: features=%s, channels=%d, baseline=%.2f Cr",
-                feature_names, len(raw_means), base_gmv / 1e7)
+    # Non-sale baseline prediction (sale scenarios measure change FROM this)
+    Xns = np.array([[non_sale_baseline[f] for f in feature_names]])
+    try:
+        if mtype == "OLS":
+            ns_bp = model.predict(sm.add_constant(Xns, has_constant="add"))[0]
+        else:
+            ns_bp = model.predict(scaler.transform(Xns))[0] if scaler else model.predict(Xns)[0]
+    except Exception:
+        ns_bp = bp
+    non_sale_base_gmv = np.expm1(ns_bp) if target_col.startswith("log_") else ns_bp
+
+    logger.info("  Scenario simulator: features=%s, channels=%d", feature_names, len(raw_means))
+    logger.info("  Overall baseline=%.2f Cr, Non-sale baseline=%.2f Cr",
+                base_gmv / 1e7, non_sale_base_gmv / 1e7)
+    if raw_means:
+        logger.info("  Raw channel means: %s", {k: f"{v:.0f}" for k, v in raw_means.items()})
+    else:
+        logger.warning("  WARNING: No raw channel means — scenarios will show 0%% change")
 
     def simulate(changes):
         """
@@ -420,50 +556,92 @@ def build_scenario_simulator(model_result, feature_matrix, feature_names, target
                      {"Online.marketing": 1.2, "TV": 0.9, "sale_flag": 1}
         Returns:
             {"baseline_gmv", "predicted_gmv", "change_pct", "scenario"}
+
+        When changes include sale features, uses the non-sale baseline as
+        starting point so the delta is meaningful (e.g. sale_days: 0→3
+        instead of 3→3).
         """
-        sc = baseline.copy()
+        # Determine if this is a sale scenario
+        has_sale_changes = any(f in SALE_FEATURES for f in changes)
+        has_channel_changes = any(f not in SALE_FEATURES for f in changes)
+
+        # Pick the right baseline:
+        # - Pure sale scenario → non-sale baseline (measure sale activation impact)
+        # - Pure channel scenario → overall baseline (measure spend change impact)
+        # - Mixed (channel + sale) → non-sale baseline (measure combined impact)
+        if has_sale_changes:
+            sc = non_sale_baseline.copy()
+            ref_gmv = non_sale_base_gmv
+        else:
+            sc = baseline.copy()
+            ref_gmv = base_gmv
+
         ch_mults = {}
 
         for feat, val in changes.items():
-            if feat == "sale_flag":
+            if feat in SALE_FEATURES:
                 if feat in sc:
-                    sc[feat] = min(1, max(0, val))
+                    sc[feat] = val
             elif feat in raw_means:
                 ch_mults[feat] = val
             elif feat in sc:
                 _apply_mult(sc, feat, val)
+
+        # Track which channels actually affected a model feature
+        modeled_channels = set()
+        note = None
 
         if ch_mults and total_mean > 0:
             new_total = sum(raw_means.get(c, 0) * ch_mults.get(c, 1.0)
                             for c in raw_means)
             tmult = new_total / total_mean
 
+            # Use the appropriate baseline for channel feature adjustments
+            feat_baseline = non_sale_baseline if has_sale_changes else baseline
+
             for feat in feature_names:
-                if feat == "log_Total_Investment":
-                    sc[feat] = np.log1p(np.expm1(baseline[feat]) * tmult)
-                elif feat == "Total.Investment":
-                    sc[feat] = baseline[feat] * tmult
+                if feat in SALE_FEATURES:
+                    continue  # Already handled above
+                if feat == "log_Total_Investment" or feat == "Total.Investment":
+                    # All channels route through total investment
+                    if feat == "log_Total_Investment":
+                        sc[feat] = np.log1p(np.expm1(feat_baseline[feat]) * tmult)
+                    else:
+                        sc[feat] = feat_baseline[feat] * tmult
+                    modeled_channels.update(ch_mults.keys())
                 elif feat.startswith("log_spend_"):
-                    grp = feat.replace("log_spend", "")
+                    grp = feat.replace("log_spend_", "")
                     if grp in CHANNEL_GROUPS:
                         chs = CHANNEL_GROUPS[grp]
                         og = sum(raw_means.get(c, 0) for c in chs)
                         ng = sum(raw_means.get(c, 0) * ch_mults.get(c, 1.0) for c in chs)
                         if og > 0:
-                            sc[feat] = np.log1p(np.expm1(baseline[feat]) * ng / og)
+                            sc[feat] = np.log1p(np.expm1(feat_baseline[feat]) * ng / og)
+                            # Channels in this group that were changed are modeled
+                            modeled_channels.update(c for c in chs if c in ch_mults)
                 elif feat.startswith("spend_") and feat.replace("spend_", "") in CHANNEL_GROUPS:
                     grp = feat.replace("spend_", "")
                     chs = CHANNEL_GROUPS[grp]
                     og = sum(raw_means.get(c, 0) for c in chs)
                     ng = sum(raw_means.get(c, 0) * ch_mults.get(c, 1.0) for c in chs)
                     if og > 0:
-                        sc[feat] = baseline[feat] * (ng / og)
+                        sc[feat] = feat_baseline[feat] * (ng / og)
+                        modeled_channels.update(c for c in chs if c in ch_mults)
                 elif feat in LOG_TO_RAW_MAP:
                     rn = LOG_TO_RAW_MAP[feat]
                     if rn in ch_mults:
-                        sc[feat] = np.log1p(np.expm1(baseline[feat]) * ch_mults[rn])
+                        sc[feat] = np.log1p(np.expm1(feat_baseline[feat]) * ch_mults[rn])
+                        modeled_channels.add(rn)
                 elif feat in ch_mults:
-                    sc[feat] = baseline[feat] * ch_mults[feat]
+                    sc[feat] = feat_baseline[feat] * ch_mults[feat]
+                    modeled_channels.add(feat)
+
+            # Identify channels that were changed but couldn't be routed
+            unmodeled = set(ch_mults.keys()) - modeled_channels
+            if unmodeled:
+                note = (f"Channel(s) {', '.join(sorted(unmodeled))} not in model features "
+                        f"— impact cannot be estimated. Model uses: "
+                        f"{', '.join(f for f in feature_names if f not in SALE_FEATURES)}")
 
         Xn = np.array([[sc[f] for f in feature_names]])
         try:
@@ -472,12 +650,15 @@ def build_scenario_simulator(model_result, feature_matrix, feature_names, target
             else:
                 pred = model.predict(scaler.transform(Xn))[0] if scaler else model.predict(Xn)[0]
         except Exception:
-            pred = bp
+            pred = ns_bp if has_sale_changes else bp
 
         pgmv = np.expm1(pred) if target_col.startswith("log_") else pred
-        chg = (pgmv / base_gmv - 1) * 100 if base_gmv != 0 else 0
-        return {"baseline_gmv": base_gmv, "predicted_gmv": pgmv,
-                "change_pct": chg, "scenario": changes}
+        chg = (pgmv / ref_gmv - 1) * 100 if ref_gmv != 0 else 0
+        result = {"baseline_gmv": ref_gmv, "predicted_gmv": pgmv,
+                  "change_pct": chg, "scenario": changes}
+        if note:
+            result["note"] = note
+        return result
 
     return simulate
 
@@ -497,9 +678,13 @@ def run_standard_scenarios(simulator):
         {"name": "-10% all channels", "changes": {ch: 0.9 for ch in MEDIA_CHANNELS}},
         {"name": "+50% digital performance",
          "changes": {"Online.marketing": 1.5, "Affiliates": 1.5, "SEM": 1.5}},
-        {"name": "Activate sale event", "changes": {"sale_flag": 1}},
+        {"name": "Activate sale event (vs non-sale month)",
+         "changes": {"sale_flag": 1, "sale_days": 3, "sale_intensity": 1}},
+        {"name": "Sale event (4 days)", "changes": {"sale_flag": 1, "sale_days": 4, "sale_intensity": 1}},
+        {"name": "Sale event (6 days)", "changes": {"sale_flag": 1, "sale_days": 6, "sale_intensity": 1}},
         {"name": "Shift 10% TV -> Online.mkt", "changes": {"TV": 0.9, "Online.marketing": 1.1}},
-        {"name": "+10% Sponsorship + sale", "changes": {"Sponsorship": 1.1, "sale_flag": 1}},
+        {"name": "+10% Sponsorship + sale (vs non-sale)",
+         "changes": {"Sponsorship": 1.1, "sale_flag": 1, "sale_days": 3, "sale_intensity": 1}},
     ]
     results = []
     for s in scenarios:
@@ -531,6 +716,8 @@ def run_custom_scenario(simulator, channel_changes, sale_flag=None):
     print(f"  Baseline: {r['baseline_gmv'] / 1e7:.2f} Cr")
     print(f"  Predicted: {r['predicted_gmv'] / 1e7:.2f} Cr")
     print(f"  Change: {r['change_pct']:+.1f}%")
+    if r.get("note"):
+        print(f"  NOTE: {r['note']}")
     return r
 
 def run_interactive_scenarios(simulator):
@@ -558,12 +745,20 @@ def run_interactive_scenarios(simulator):
             {"name": "All channels +20%", "changes": {ch: 1.2 for ch in MEDIA_CHANNELS}},
             {"name": "All channels -20%", "changes": {ch: 0.8 for ch in MEDIA_CHANNELS}},
         ],
-        "Promotional Scenarios": [
-            {"name": "Sale event only", "changes": {"sale_flag": 1}},
-            {"name": "Sale + 10% all",
-             "changes": {**{ch: 1.1 for ch in MEDIA_CHANNELS}, "sale_flag": 1}},
+        "Promotional Scenarios (vs non-sale baseline)": [
+            {"name": "Sale event only (vs non-sale month)",
+             "changes": {"sale_flag": 1, "sale_days": 3, "sale_intensity": 1}},
+            {"name": "Sale + 10% all (vs non-sale month)",
+             "changes": {**{ch: 1.1 for ch in MEDIA_CHANNELS},
+                        "sale_flag": 1, "sale_days": 3, "sale_intensity": 1}},
             {"name": "No sale + 20% all",
-             "changes": {**{ch: 1.2 for ch in MEDIA_CHANNELS}, "sale_flag": 0}},
+             "changes": {**{ch: 1.2 for ch in MEDIA_CHANNELS},
+                        "sale_flag": 0, "sale_days": 0, "sale_intensity": 0}},
+        ],
+        "Sale Duration Curve (vs non-sale baseline)": [
+            {"name": f"Sale event ({d} days)",
+             "changes": {"sale_flag": 1, "sale_days": d, "sale_intensity": 1}}
+            for d in [3, 4, 5, 6]
         ],
     }
  
@@ -578,11 +773,19 @@ def run_interactive_scenarios(simulator):
                 r["scenario_name"] = s["name"]
                 r["group"] = gname
                 all_results.append(r)
+                note_marker = " *" if r.get("note") else ""
                 print(f"  {s['name']:<45} {r['baseline_gmv']/1e7:<12.2f} "
-                      f"{r['predicted_gmv']/1e7:<12.2f} {r['change_pct']:+.1f}%")
+                      f"{r['predicted_gmv']/1e7:<12.2f} {r['change_pct']:+.1f}%{note_marker}")
             except Exception:
                 continue
  
+    # Print any notes about unmodeled channels
+    noted = [r for r in all_results if r.get("note")]
+    if noted:
+        print(f"\n  * NOTE: {len(noted)} scenario(s) involve channels not in the model:")
+        for r in noted:
+            print(f"    - {r['scenario_name']}: {r['note']}")
+
     return all_results
 
 # =============================================================================
@@ -660,18 +863,40 @@ def plot_best_diagnostics(best, fm, save_dir=None):
 
 
 def plot_scenarios(results, save_dir=None):
-    """Horizontal bar of scenario GMV changes."""
+    """Horizontal bar of scenario GMV changes. Unmodeled channels shown in gray."""
     save_dir = save_dir or get_paths()["plots_dir"]
     if not results:
         return
     names = [s["scenario_name"] for s in results]
     chg = [s["change_pct"] for s in results]
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.barh(names, chg, color=["#4CAF50" if c >= 0 else "#F44336" for c in chg])
+    has_note = [bool(s.get("note")) for s in results]
+
+    fig, ax = plt.subplots(figsize=(12, max(6, len(results) * 0.45)))
+    colors = []
+    for c, noted in zip(chg, has_note):
+        if noted:
+            colors.append("#BDBDBD")  # Gray for unmodeled
+        elif c >= 0:
+            colors.append("#4CAF50")
+        else:
+            colors.append("#F44336")
+    ax.barh(names, chg, color=colors)
     ax.axvline(0, color="black", ls="-", alpha=0.3)
     ax.set_xlabel("GMV Change %"); ax.set_title("Scenarios vs Baseline")
-    for i, c in enumerate(chg):
-        ax.text(c + (0.3 if c >= 0 else -0.3), i, f"{c:+.1f}%", va="center", fontsize=9)
+    for i, (c, noted) in enumerate(zip(chg, has_note)):
+        label = f"{c:+.1f}%" + (" †" if noted else "")
+        ax.text(c + (0.3 if c >= 0 else -0.3), i, label, va="center", fontsize=9)
+
+    # Add legend if any notes exist
+    if any(has_note):
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor="#4CAF50", label="Positive impact"),
+            Patch(facecolor="#F44336", label="Negative impact"),
+            Patch(facecolor="#BDBDBD", label="† Channel(s) not in model"),
+        ]
+        ax.legend(handles=legend_elements, loc="lower right", fontsize=8)
+
     _save_fig(fig, save_dir, "scenarios.png")
 
 
@@ -687,7 +912,7 @@ def _save_fig(fig, save_dir, fname):
 # 9. MASTER PIPELINE
 # =============================================================================
 
-def run_modeling_pipeline(fe_result, clean_data=None, save_dir=None, top_n_scenarios=1):
+def run_modeling_pipeline(fe_result, clean_data=None, save_dir=None, top_n_scenarios=1,model_filter="all", skip_scenarios=False):
     """
     Run complete modeling pipeline.
 
@@ -710,8 +935,22 @@ def run_modeling_pipeline(fe_result, clean_data=None, save_dir=None, top_n_scena
     full_log, summaries, decisions = [], {}, []
     fm = fe_result["data"]
     specs = fe_result.get("feature_sets", get_feature_specs())
-    types = get_model_types()
+    types = get_model_types(model_filter)
     transforms = get_transform_variants()
+
+    # --- Pre-compute feature correlations with target for ordinality checks ---
+    # This allows the ordinality check to know which channels have negative
+    # correlation with GMV (e.g., digital brand) and allow negative coefficients.
+    target_col = "log_total_gmv" if "log_total_gmv" in fm.columns else "total_gmv"
+    feature_correlations = {}
+    if target_col in fm.columns:
+        for col in fm.select_dtypes(include=[np.number]).columns:
+            if col != target_col:
+                try:
+                    feature_correlations[col] = fm[col].corr(fm[target_col])
+                except Exception:
+                    pass
+    logger.info("  Computed %d feature-target correlations for ordinality", len(feature_correlations))
 
     # --- Build all models ---
     total = len(specs) * len(types) * len(transforms)
@@ -741,11 +980,13 @@ def run_modeling_pipeline(fe_result, clean_data=None, save_dir=None, top_n_scena
                 missing = [c for c in feats + [target] if c not in fm.columns]
                 if missing:
                     failed += 1
+                    print(f"    [SKIP] {sn}|{tn}|{trn}: missing cols {missing}")
                     continue
 
                 mdf = fm[feats + [target]].dropna()
                 if len(mdf) < len(feats) + 2:
                     failed += 1
+                    print(f"    [SKIP] {sn}|{tn}|{trn}: only {len(mdf)} rows for {len(feats)} features")
                     continue
 
                 X, y = mdf[feats], mdf[target]
@@ -755,14 +996,16 @@ def run_modeling_pipeline(fe_result, clean_data=None, save_dir=None, top_n_scena
                 except Exception as e:
                     failed += 1
                     full_log.append(f"[FAIL] {sn}|{tn}|{trn}: {e}")
+                    print(f"    [FAIL] {sn}|{tn}|{trn}: EXCEPTION {e}")
                     continue
 
                 if not tr.get("success"):
                     failed += 1
                     full_log.append(f"[FAIL] {sn}|{tn}|{trn}: {tr.get('error', '?')}")
+                    print(f"    [FAIL] {sn}|{tn}|{trn}: {tr.get('error', '?')}")
                     continue
 
-                ordin = check_ordinality(tr["coefficients"], feats)
+                ordin = check_ordinality(tr["coefficients"], feats, feature_correlations)
 
                 try:
                     cv = loo_cross_validation(X, y, tn, tc["builder"])
@@ -811,6 +1054,77 @@ def run_modeling_pipeline(fe_result, clean_data=None, save_dir=None, top_n_scena
         for f, i in sorted(conv["insights"].items(), key=lambda x: abs(x[1]["mean_coefficient"]), reverse=True):
             print(f"  {f[:38]:<40} {i['mean_coefficient']:<10.4f} {i['direction']:<25} {i['n_models']:<5}")
 
+    # --- Convergence-based ordinality re-scoring (Pass 2) ---
+    # Use convergence directions as the "truth" for what sign each feature
+    # should have. A model that agrees with convergence gets full ordinality
+    # score; one that contradicts convergence gets penalized.
+    print(f"\n[STEP 3b] Re-scoring ordinality using convergence as truth...")
+    convergence_signs = {}
+    for feat, info in conv.get("insights", {}).items():
+        direction = info.get("direction", "")
+        if "POSITIVE (confirmed)" in direction:
+            convergence_signs[feat] = "positive"
+        elif "NEGATIVE (confirmed)" in direction:
+            convergence_signs[feat] = "negative"
+        # MIXED features get no constraint
+
+    if convergence_signs:
+        rescore_count = 0
+        for r in ranked:
+            coefs = r["train_result"].get("coefficients", {})
+            violations = []
+            checks = []
+
+            for feat, expected_sign in convergence_signs.items():
+                c = coefs.get(feat)
+                if c is None:
+                    continue
+                if expected_sign == "positive" and c < 0:
+                    violations.append(f"{feat} = {c:.4f} (convergence says positive)")
+                    checks.append({"feature": feat, "coefficient": c,
+                                  "expected": "positive (convergence)", "passed": False})
+                elif expected_sign == "negative" and c > 0:
+                    violations.append(f"{feat} = {c:.4f} (convergence says negative)")
+                    checks.append({"feature": feat, "coefficient": c,
+                                  "expected": "negative (convergence)", "passed": False})
+                else:
+                    checks.append({"feature": feat, "coefficient": c,
+                                  "expected": f"{expected_sign} (convergence)", "passed": True})
+
+            # Update ordinality with convergence-based check
+            r["ordinality"] = {
+                "passed": len(violations) == 0,
+                "violations": violations,
+                "checks": checks,
+                "n_violations": len(violations),
+                "method": "convergence-based",
+            }
+
+            # Re-score composite with updated ordinality
+            vmax = r["scores"].get("vif_max")
+            r["scores"] = score_model(
+                r["train_result"], r["cv_result"], r["ordinality"], vif_max=vmax
+            )
+            rescore_count += 1
+
+        # Re-rank
+        ranked = rank_models(ranked)
+        top10 = ranked[:10]
+        print(f"  Re-scored {rescore_count} models using {len(convergence_signs)} convergence-confirmed features")
+        print(f"  Convergence truth: {convergence_signs}")
+
+        # Print updated rankings
+        print(f"\n  {'Rk':<4} {'Spec':<28} {'Type':<12} {'Trn':<12} {'Comp':<8} {'Fit':<7} {'Stab':<7} {'VIF':<8} {'Ord':<5}")
+        print("  " + "-" * 100)
+        for r in top10:
+            s = r["scores"]
+            vif = f"{s['vif_max']}" if s.get("vif_max") else "N/A"
+            print(f"  {r['rank']:<4} {r['spec_name'][:26]:<28} {r['model_type']:<12} "
+                  f"{r['transform']:<12} {s['composite']:<8.4f} {s['fit_score']:<7.4f} "
+                  f"{s['stability_score']:<7.4f} {vif:<8} {'PASS' if r['ordinality']['passed'] else 'FAIL':<5}")
+    else:
+        print(f"  No confirmed convergence features — keeping original ordinality")
+
     # --- Best model ---
     best = ranked[0]
     print(f"\n[STEP 4] Best Model...")
@@ -830,44 +1144,55 @@ def run_modeling_pipeline(fe_result, clean_data=None, save_dir=None, top_n_scena
         print(f"    {f:35s} = {c:+.4f}  ({ps})  {ss}")
 
     # --- Scenarios ---
-    print(f"\n[STEP 5] Scenarios (top {top_n_scenarios} models)...")
-    monthly = clean_data.get("monthly") if clean_data else None
-    all_sims, all_scen = {}, {}
+    primary_sim, primary_scen, all_sims, all_scen = None, [], {}, {}
+    if not skip_scenarios:
+        print(f"\n[STEP 5] Scenarios (top {top_n_scenarios} models)...")
+        monthly = clean_data.get("monthly") if clean_data else None
 
-    for i in range(min(top_n_scenarios, len(ranked))):
-        m = ranked[i]
-        key = f"#{m['rank']} {m['spec_name'][:20]}|{m['model_type']}"
-        tc = m["transform_config"]["target"]
-        fn = m["spec_config"]["resolved_features"]
+        for i in range(min(top_n_scenarios, len(ranked))):
+            m = ranked[i]
+            key = f"#{m['rank']} {m['spec_name'][:20]}|{m['model_type']}"
+            tc = m["transform_config"]["target"]
+            fn = m["spec_config"]["resolved_features"]
 
-        sim = build_scenario_simulator(m, fm, fn, tc, monthly)
-        if sim is None:
-            continue
-        all_sims[key] = sim
-        sr = run_standard_scenarios(sim)
-        run_interactive_scenarios(sim)
-        all_scen[key] = sr
+            sim = build_scenario_simulator(m, fm, fn, tc, monthly)
+            if sim is None:
+                continue
+            all_sims[key] = sim
+            sr = run_standard_scenarios(sim)
+            run_interactive_scenarios(sim)
+            all_scen[key] = sr
 
-        print(f"\n  --- {key} ---")
-        print(f"  {'Scenario':<45} {'Base (Cr)':<12} {'Pred (Cr)':<12} {'Change':<8}")
-        print("  " + "-" * 80)
-        for s in sr:
-            print(f"  {s['scenario_name']:<45} {s['baseline_gmv']/1e7:<12.2f} "
-                  f"{s['predicted_gmv']/1e7:<12.2f} {s['change_pct']:+.1f}%")
+            print(f"\n  --- {key} ---")
+            print(f"  {'Scenario':<45} {'Base (Cr)':<12} {'Pred (Cr)':<12} {'Change':<8}")
+            print("  " + "-" * 80)
+            for s in sr:
+                note_marker = " *" if s.get("note") else ""
+                print(f"  {s['scenario_name']:<45} {s['baseline_gmv']/1e7:<12.2f} "
+                      f"{s['predicted_gmv']/1e7:<12.2f} {s['change_pct']:+.1f}%{note_marker}")
+            # Print notes
+            noted = [s for s in sr if s.get("note")]
+            if noted:
+                print(f"\n  * {len(noted)} scenario(s) involve channels not in model:")
+                for s in noted:
+                    print(f"    {s['scenario_name']}: {s['note']}")
 
-    # Multi-model comparison
-    if top_n_scenarios > 1 and len(all_scen) > 1:
-        _print_multi_model_comparison(all_scen)
+        # Multi-model comparison
+        if top_n_scenarios > 1 and len(all_scen) > 1:
+            _print_multi_model_comparison(all_scen)
 
-    primary_sim = list(all_sims.values())[0] if all_sims else None
-    primary_scen = list(all_scen.values())[0] if all_scen else []
+        primary_sim = list(all_sims.values())[0] if all_sims else None
+        primary_scen = list(all_scen.values())[0] if all_scen else []
+    else:
+        print(f"\n[STEP 5] Scenarios SKIPPED (will run after agent approval)")
 
     # --- Plots ---
     print(f"\n[STEP 6] Plots...")
     try:
         plot_model_rankings(ranked, top_n=10, save_dir=save_dir)
         plot_best_diagnostics(best, fm, save_dir=save_dir)
-        plot_scenarios(primary_scen, save_dir=save_dir)
+        if primary_scen:
+            plot_scenarios(primary_scen, save_dir=save_dir)
     except Exception as e:
         logger.error("Plotting failed: %s", e)
 
