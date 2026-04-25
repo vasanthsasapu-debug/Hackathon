@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agentic MMIX Pipeline — Architecture Diagram</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #f7f8fc; color: #2d3748; min-height: 100vh; }
+        .header { text-align: center; padding: 36px 24px 12px; background: #ffffff; border-bottom: 3px solid #4361ee; }
+        .header h1 { font-size: 26px; font-weight: 700; color: #1a202c; }
+        .header p { font-size: 14px; color: #718096; margin-top: 6px; }
+        .legend { display: flex; justify-content: center; gap: 28px; padding: 16px; flex-wrap: wrap; }
+        .legend-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #4a5568; font-weight: 500; }
+        .legend-dot { width: 14px; height: 14px; border-radius: 4px; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+        .pipeline { display: flex; flex-direction: column; gap: 3px; position: relative; }
+        .pipeline::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; background: linear-gradient(to bottom, #4361ee, #7c3aed, #06b6d4); opacity: 0.15; z-index: 0; }
+        .phase { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px 24px; position: relative; z-index: 1; transition: box-shadow 0.2s, border-color 0.2s; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+        .phase:hover { border-color: #4361ee; box-shadow: 0 4px 12px rgba(67, 97, 238, 0.1); }
+        .phase-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+        .phase-number { width: 38px; height: 38px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 15px; color: #fff; flex-shrink: 0; }
+        .phase-title { font-size: 16px; font-weight: 600; color: #1a202c; }
+        .phase-module { font-size: 12px; color: #4361ee; font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; margin-left: auto; background: #eef2ff; padding: 3px 12px; border-radius: 12px; font-weight: 500; }
+        .phase-body { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; }
+        .phase-body.single { grid-template-columns: 1fr; }
+        .phase-body.triple { grid-template-columns: 1fr 1fr 1fr; }
+        .detail-block { background: #f7f8fc; border-radius: 8px; padding: 14px 16px; font-size: 13px; line-height: 1.65; color: #4a5568; border: 1px solid #edf2f7; }
+        .detail-block strong { color: #2d3748; font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; display: block; margin-bottom: 6px; }
+        .entry-card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+        .entry-card code { display: block; font-size: 12px; color: #4361ee; font-family: 'JetBrains Mono', monospace; background: #eef2ff; padding: 6px 12px; border-radius: 8px; margin-top: 10px; font-weight: 500; }
+        .entry-card .label { font-size: 14px; font-weight: 600; color: #1a202c; }
+        .entry-card .desc { font-size: 12px; color: #718096; margin-top: 4px; }
+        .loop-wrapper { border: 2px solid #ef4444; border-radius: 16px; padding: 4px; position: relative; background: #fef2f2; }
+        .loop-wrapper .phase { background: #ffffff; }
+        .loop-badge { position: absolute; top: -14px; left: 24px; background: #ef4444; color: #fff; font-size: 12px; font-weight: 700; padding: 4px 18px; border-radius: 12px; }
+        .loop-arrow { text-align: center; padding: 10px; font-size: 13px; color: #ef4444; font-weight: 600; }
+        .decision { background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); border-radius: 12px; padding: 16px 24px; text-align: center; color: #fff; }
+        .decision .label { font-weight: 700; font-size: 15px; }
+        .decision .paths { display: flex; justify-content: center; gap: 40px; margin-top: 10px; font-size: 13px; }
+        .decision .path-proceed { color: #bbf7d0; font-weight: 600; }
+        .decision .path-retry { color: #fef08a; font-weight: 600; }
+        .connector { text-align: center; padding: 4px 0; color: #cbd5e1; font-size: 18px; }
+        .outputs-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 8px; }
+        .output-card { background: #f7f8fc; border-radius: 8px; padding: 14px 16px; font-size: 13px; line-height: 1.65; color: #4a5568; border-left: 3px solid #7c3aed; border-top: 1px solid #edf2f7; border-right: 1px solid #edf2f7; border-bottom: 1px solid #edf2f7; }
+        .output-card strong { color: #2d3748; display: block; margin-bottom: 6px; font-size: 13px; }
+        .iter-flow { margin-top: 20px; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+        .iter-flow .if-header { font-size: 15px; font-weight: 700; color: #4361ee; margin-bottom: 14px; }
+        .iter-steps { display: flex; align-items: stretch; gap: 8px; }
+        .iter-step { flex: 1; background: #f7f8fc; border-radius: 8px; padding: 14px 16px; font-size: 13px; line-height: 1.65; color: #4a5568; border: 1px solid #edf2f7; }
+        .iter-step.active { border-left: 4px solid #4361ee; }
+        .iter-step.retry { border-left: 4px solid #ef4444; }
+        .iter-step.accept { border-left: 4px solid #22c55e; }
+        .iter-arrow { font-size: 20px; color: #94a3b8; flex-shrink: 0; display: flex; align-items: center; }
+        .bg-blue { background: #4361ee; } .bg-cyan { background: #0891b2; } .bg-violet { background: #7c3aed; }
+        .bg-red { background: #ef4444; } .bg-slate { background: #475569; } .bg-green { background: #16a34a; }
+        .footer { text-align: center; padding: 24px; font-size: 12px; color: #94a3b8; border-top: 1px solid #e2e8f0; margin-top: 28px; }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1>Agentic MMIX Pipeline — System Architecture</h1>
+    <p>Marketing Mix Modeling with LLM-Driven Quality Evaluation, Convergence-Based Ordinality &amp; Iterative Self-Improvement</p>
+    <div class="legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#4361ee"></div> Processing</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#0891b2"></div> Data</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div> Decision</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#7c3aed"></div> Output</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#475569"></div> Config</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#16a34a"></div> Post-Loop</div>
+    </div>
+</div>
+
+<div class="container">
+<div class="pipeline">
+
+    <!-- ENTRY -->
+    <div class="entry-card" style="border-color:#4361ee; border-width:2px; margin-bottom: 16px;">
+        <div class="label">⚡ Single Entry Point — All Runs Are Agentic</div>
+        <div class="desc">main.py calls run_agentic_pipeline(). If model passes iteration 1, proceeds immediately.</div>
+        <code>python main.py -g weekly</code>
+    </div>
+
+    <!-- CONFIG -->
+    <div class="phase" style="border-left: 4px solid #475569;">
+        <div class="phase-header">
+            <div class="phase-number bg-slate">⚙</div>
+            <div class="phase-title">Configuration — Single Source of Truth</div>
+            <div class="phase-module">config.py</div>
+        </div>
+        <div class="phase-body">
+            <div class="detail-block"><strong>Channel Groups (EDA-Validated)</strong>traditional: TV, Sponsorship<br>digital_performance: Online.mkt, Affiliates<br>digital_brand: Digital, Content.Mkt, SEM<br>other: Radio, Other<br><em>SEM moved to digital_brand based on correlation evidence (r=0.97 with Digital)</em></div>
+            <div class="detail-block"><strong>Model Settings</strong>6 model types (OLS, Ridge, Lasso, ElasticNet, Bayesian, Huber)<br>Composite: 35% Fit + 25% Stability + 25% Ordinality + 15% VIF<br>HARD thresholds: R² ≥ 0.50 (weekly), R² ≥ 0.70 (monthly)</div>
+        </div>
+    </div>
+
+    <div class="connector">▼</div>
+
+    <!-- PHASE 1 -->
+    <div class="phase" style="border-left: 4px solid #0891b2;">
+        <div class="phase-header">
+            <div class="phase-number bg-cyan">1</div>
+            <div class="phase-title">Data Loading</div>
+            <div class="phase-module">eda_pipeline.py → load_all_data()</div>
+        </div>
+        <div class="phase-body single">
+            <div class="detail-block">Load 7 CSV datasets via config registry · Post-load fixes · Returns Dict[str, DataFrame] with 1.6M+ rows · <strong>Shared with EDA — no double loading</strong></div>
+        </div>
+    </div>
+
+    <div class="connector">▼</div>
+
+    <!-- PHASE 2 -->
+    <div class="phase" style="border-left: 4px solid #4361ee;">
+        <div class="phase-header">
+            <div class="phase-number bg-blue">2</div>
+            <div class="phase-title">Exploratory Data Analysis</div>
+            <div class="phase-module">eda_pipeline.py → run_full_eda(data=pre_loaded)</div>
+        </div>
+        <div class="phase-body">
+            <div class="detail-block"><strong>11 Analysis Functions + 7 Plots</strong>Column classification · Validation · NPS-revenue · Channel overlap · Category breakdown · Sale impact (+116.5% lift) · Trends · Media investment · Correlation matrix</div>
+            <div class="detail-block"><strong>NEW: Correlation Intelligence</strong>Feature-GMV sign classification (positive vs negative channels)<br>Inter-channel correlations (grouping candidates |r|>0.85)<br>Channel GROUP correlations (spec validation)<br>NPS seasonality detection (r=-0.96 with GMV)<br><em>→ Fed to LLM as dynamic EDA context</em></div>
+        </div>
+    </div>
+
+    <div class="connector">▼</div>
+
+    <!-- PHASE 3 -->
+    <div class="phase" style="border-left: 4px solid #4361ee;">
+        <div class="phase-header">
+            <div class="phase-number bg-blue">3</div>
+            <div class="phase-title">Outlier Detection &amp; Cleaning</div>
+            <div class="phase-module">outlier_detection.py</div>
+        </div>
+        <div class="phase-body">
+            <div class="detail-block"><strong>Cleaning</strong>Exclude Aug 2015 (A1) · Set negatives to 0 · Coerce channels · Validate NPS · Cap discount at MRP · Remove partial/zero-GMV weeks</div>
+            <div class="detail-block"><strong>9 Documented Assumptions (A1-A9)</strong>A1: Aug excluded · A2: Discount spikes kept · A3: Zero-spend kept<br>A4: NPS as seasonality proxy · A5: Festival peaks kept<br>A6: Discount as control · A7: Sample size limits<br>A8: Sales GMV dtype fix · A9: Radio/Other negative OK</div>
+        </div>
+    </div>
+
+    <div class="connector">▼</div>
+
+    <!-- PHASE 4 -->
+    <div class="phase" style="border-left: 4px solid #0891b2;">
+        <div class="phase-header">
+            <div class="phase-number bg-cyan">4</div>
+            <div class="phase-title">Data Aggregation</div>
+            <div class="phase-module">data_aggregation.py</div>
+        </div>
+        <div class="phase-body">
+            <div class="detail-block"><strong>Weekly (47 periods)</strong>Transaction → 7-day rollups · Sale event mapping (44 dates) · NPS join · Derived columns</div>
+            <div class="detail-block"><strong>Monthly (10 periods)</strong>From cleaned monthly data · Same enrichment · Max 3 predictors<br><em>Agent can re-aggregate to monthly on iteration 3</em></div>
+        </div>
+    </div>
+
+    <div class="connector">▼</div>
+
+    <!-- AGENTIC LOOP -->
+    <div class="loop-wrapper">
+        <div class="loop-badge">⚡ AGENTIC ITERATIVE LOOP — max 3 iterations</div>
+
+        <!-- PHASE 5 -->
+        <div class="phase" style="margin-top: 18px; border-left: 4px solid #ef4444;">
+            <div class="phase-header">
+                <div class="phase-number bg-red">5</div>
+                <div class="phase-title">Feature Engineering (Strategy-Filtered)</div>
+                <div class="phase-module">feature_engineering.py</div>
+            </div>
+            <div class="phase-body">
+                <div class="detail-block"><strong>10 Curated Specs</strong>A-F: Base (3 features, monthly-safe)<br>G-J: Weekly (6-8 features, group-based)<br>Data-driven channel ranking (|corr| with GMV)<br>NPS as seasonality proxy (A4)<br>No individual channels in weekly specs (VIF too high)</div>
+                <div class="detail-block"><strong>Agent Spec Strategy</strong><strong style="color:#4361ee">base:</strong> specs A-F only (iteration 1)<br><strong style="color:#ef4444">expanded:</strong> specs G-J only — delta (iteration 2)<br><strong style="color:#475569">groups:</strong> specs A, J only (VIF issues)<br><strong style="color:#7c3aed">monthly:</strong> A-F on monthly data (iteration 3)</div>
+            </div>
+        </div>
+
+        <div class="connector">▼</div>
+
+        <!-- PHASE 6 -->
+        <div class="phase" style="border-left: 4px solid #ef4444;">
+            <div class="phase-header">
+                <div class="phase-number bg-red">6</div>
+                <div class="phase-title">Modeling (No Scenarios — Two-Pass Ranking)</div>
+                <div class="phase-module">modeling_engine.py</div>
+            </div>
+            <div class="phase-body">
+                <div class="detail-block"><strong>Build &amp; Score</strong>6 types × specs × 2 transforms<br>Iter 1: 72 models · Iter 2: 48 (delta only)<br>LOO cross-validation · VIF check<br>Scenarios SKIPPED (run after approval)</div>
+                <div class="detail-block"><strong>Convergence-Based Ordinality (Two-Pass)</strong><strong>Pass 1:</strong> Build all → initial rank → compute convergence<br><strong>Pass 2:</strong> Re-score ordinality using convergence as truth → re-rank<br>Models agreeing with consensus get full ordinality score<br>Models contradicting consensus get penalized</div>
+            </div>
+        </div>
+
+        <div class="connector">▼</div>
+
+        <!-- PHASE 7 -->
+        <div class="phase" style="border-left: 4px solid #ef4444;">
+            <div class="phase-header">
+                <div class="phase-number bg-red">7</div>
+                <div class="phase-title">Quality Evaluation — Three-Layer Enforcement</div>
+                <div class="phase-module">agent_orchestrator.py → QualityEvaluator</div>
+            </div>
+            <div class="phase-body triple">
+                <div class="detail-block"><strong>Layer 1: Rule-Based HARD</strong>R² ≥ 0.50 (weekly)<br>Adj R² ≥ 0.45<br>Ordinality PASS<br>CV stability ≥ 0.5<br><em>Deterministic. Cannot be overridden.</em></div>
+                <div class="detail-block"><strong>Layer 2: LLM (GPT-4.1)</strong>Receives HARD + SOFT criteria<br>EDA findings (dynamic from data)<br>Convergence as ground truth<br>Must RETRY if HARD fails<br>Can trigger RETRY on SOFT issues</div>
+                <div class="detail-block"><strong>Layer 3: Decision Logic</strong>Rule FAIL → RETRY (always)<br>Rule PASS + LLM RETRY → RETRY<br>Rule PASS + LLM ACCEPT → PROCEED<br>Max iterations → PROCEED</div>
+            </div>
+            <div class="decision" style="margin-top: 12px;">
+                <div class="label">AGENT DECISION</div>
+                <div class="paths">
+                    <div class="path-proceed">✅ PROCEED → scenarios + narratives</div>
+                    <div class="path-retry">🔁 RETRY → adjust strategy → loop back</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="loop-arrow">🔁 RETRY: Iter 1→2: expand to group specs (G-J) · Iter 2→3: switch to monthly granularity</div>
+    </div>
+
+    <div class="connector">▼</div>
+
+    <!-- PHASE 8 -->
+    <div class="phase" style="border-left: 4px solid #16a34a;">
+        <div class="phase-header">
+            <div class="phase-number bg-green">8</div>
+            <div class="phase-title">Scenario Simulation (Approved Model Only)</div>
+            <div class="phase-module">modeling_engine.py → post-loop</div>
+        </div>
+        <div class="phase-body single">
+            <div class="detail-block">11+ what-if scenarios on the approved best model only · Individual channel +20% · Budget reallocation · Scale scenarios (±10-20% all) · Sale event activation · Combined (sale + channel increase) · Raw channel names translated to model features automatically</div>
+        </div>
+    </div>
+
+    <div class="connector">▼</div>
+
+    <!-- PHASE 9 -->
+    <div class="phase" style="border-left: 4px solid #16a34a;">
+        <div class="phase-header">
+            <div class="phase-number bg-green">9</div>
+            <div class="phase-title">AI Narrative Generation (With Agent Context)</div>
+            <div class="phase-module">narrative_generator.py → GPT-4.1</div>
+        </div>
+        <div class="phase-body">
+            <div class="detail-block"><strong>5 Section Narratives</strong>① EDA summary · ② Data quality &amp; cleaning<br>③ Feature engineering (with VIF &amp; correlation context)<br>④ Model results (with convergence &amp; agent iteration history)<br>⑤ Scenario recommendations</div>
+            <div class="detail-block"><strong>Agent Context Passed</strong>Number of iterations &amp; quality progression<br>Strategy changes (base → expanded → monthly)<br>What adjustments were made and why<br>EDA-discovered insights (NPS, negative channels)<br>Convergence-confirmed feature directions</div>
+        </div>
+    </div>
+
+    <div class="connector">▼</div>
+
+    <!-- OUTPUTS -->
+    <div class="phase" style="border-left: 4px solid #7c3aed;">
+        <div class="phase-header">
+            <div class="phase-number bg-violet">📦</div>
+            <div class="phase-title">Final Outputs</div>
+        </div>
+        <div class="outputs-grid">
+            <div class="output-card"><strong>📊 13 Visualizations</strong>outputs/plots/<br>correlation_analysis · nps_revenue · channel_overlap · category_breakdown · special_sale_impact · media_investment · national_trends · outlier_summary · feature_distributions · features_vs_target · model_rankings · best_model_diagnostics · scenarios</div>
+            <div class="output-card"><strong>📄 Reports</strong>outputs/reports/<br>mmix_narrative_report.md — AI-generated business report (5 sections + agent context)<br>agent_reasoning_trace.txt — Timestamped decision log with quality progression</div>
+            <div class="output-card"><strong>🧠 Reasoning Trace</strong>Every decision recorded:<br>• Timestamp · Phase · Iteration<br>• Strategy (base/expanded/monthly)<br>• Quality scores per iteration<br>• LLM verdict + reasoning<br>• Model comparison (prev vs current)</div>
+        </div>
+    </div>
+
+    <!-- ITERATION FLOW -->
+    <div class="iter-flow">
+        <div class="if-header">📈 Iteration Flow — Progressive Strategy Escalation</div>
+        <div class="iter-steps">
+            <div class="iter-step retry">
+                <strong style="color:#ef4444;">Iteration 1: Base</strong>
+                Specs A-F (3 features each)<br>
+                72 models built<br>
+                R² ~0.47 → below 0.50 threshold<br>
+                <strong style="color:#ef4444;">→ RETRY</strong>
+            </div>
+            <div class="iter-arrow">→</div>
+            <div class="iter-step accept">
+                <strong style="color:#16a34a;">Iteration 2: Expanded (Delta)</strong>
+                Specs G-J only (6-8 features)<br>
+                48 NEW models (not re-running A-F)<br>
+                R² ~0.58 → above 0.50 threshold<br>
+                Compare vs iter 1 best → keep winner<br>
+                <strong style="color:#16a34a;">→ ACCEPT</strong>
+            </div>
+            <div class="iter-arrow">→</div>
+            <div class="iter-step active" style="opacity: 0.5;">
+                <strong style="color:#7c3aed;">Iteration 3: Monthly (if needed)</strong>
+                Re-aggregate to monthly (10 pts)<br>
+                Specs A-F on different granularity<br>
+                72 models, R² threshold: 0.70<br>
+                Last resort before accepting best
+            </div>
+        </div>
+    </div>
+
+</div>
+</div>
+
+<div class="footer">
+    Agentic MMIX Pipeline · E-Commerce Marketing Mix Modeling · AI Practice Hackathon
+</div>
+
+</body>
+</html>

@@ -1,0 +1,104 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'primaryColor': '#4361ee', 'primaryTextColor': '#ffffff', 'lineColor': '#ef4444', 'secondaryColor': '#0891b2', 'tertiaryColor': '#7c3aed', 'background': '#f7f8fc' } } }%%
+
+flowchart TD
+    %% ===== ENTRY =====
+    MAIN["main.py (CLI)<br/>All runs are agentic"]
+    MAIN --> CONFIG
+
+    %% ===== CONFIG =====
+    CONFIG[("⚙️ config.py<br/>Paths · 9 Channels · 4 Groups<br/>6 Model Types · LLM Config<br/>Composite Weights 35/25/25/15")]
+
+    %% ===== PHASE 1-4: RUN ONCE =====
+    CONFIG --> P1
+    subgraph ONCE["Phases 1-4 — Run Once"]
+        P1["PHASE 1: Data Loading<br/>eda_pipeline.py → load_all_data()<br/>7 CSV files → 1.6M+ rows"]
+        P1 --> P2
+        P2["PHASE 2: EDA<br/>11 analyses · 7 plots<br/>Correlation intelligence:<br/>• Feature-GMV signs<br/>• Inter-channel r > 0.85<br/>• Group-level validation<br/>• NPS seasonality flag<br/><i>Uses pre-loaded data (no double load)</i>"]
+        P2 --> P3
+        P3["PHASE 3: Outlier Detection<br/>IQR + Z-score + business context<br/>9 Assumptions (A1-A9)<br/>Excl Aug 2015 · NPS as proxy (A4)"]
+        P3 --> P4
+        P4["PHASE 4: Aggregation<br/>Weekly: 47 periods<br/>Monthly: 10 periods (iter 3 fallback)"]
+    end
+
+    %% ===== AGENTIC LOOP =====
+    P4 --> LOOP_START
+    subgraph LOOP["⚡ Agentic Iterative Loop — max 3 iterations"]
+        LOOP_START{{"Iteration?"}}
+
+        %% ITERATION STRATEGIES
+        LOOP_START -->|"Iter 1: base"| FEAT1["PHASE 5: Features<br/>Specs A-F only (6 specs, 3 feats)<br/>Strategy: base"]
+        LOOP_START -->|"Iter 2: expanded"| FEAT2["PHASE 5: Features<br/>Specs G-J only (4 specs, 6-8 feats)<br/>Strategy: expanded (delta)"]
+        LOOP_START -->|"Iter 3: monthly"| REAGG["Re-aggregate<br/>to monthly (10 pts)"] --> FEAT3["PHASE 5: Features<br/>Specs A-F (monthly)<br/>Strategy: monthly"]
+
+        FEAT1 --> MODEL
+        FEAT2 --> MODEL
+        FEAT3 --> MODEL
+
+        %% MODELING
+        MODEL["PHASE 6: Modeling (no scenarios)<br/>Build all → Initial rank<br/>→ Convergence analysis<br/>→ Re-rank with convergence truth<br/>(two-pass ordinality)"]
+
+        %% COMPARE
+        MODEL --> COMPARE{"Compare vs<br/>previous best?"}
+        COMPARE -->|"Better R²"| EVAL
+        COMPARE -->|"Worse — keep previous"| EVAL
+
+        %% EVALUATION
+        EVAL["PHASE 7: Quality Evaluation"]
+        EVAL --> HARD["Layer 1: HARD Rules<br/>R² ≥ 0.50 (weekly)<br/>R² ≥ 0.70 (monthly)<br/>Adj R² ≥ 0.45<br/>Ordinality PASS<br/>CV stability ≥ 0.5"]
+        EVAL --> LLM["Layer 2: LLM (GPT-4.1)<br/>HARD/SOFT criteria<br/>+ EDA context (dynamic)<br/>+ Convergence truth"]
+        HARD --> DECIDE
+        LLM --> DECIDE
+
+        %% DECISION
+        DECIDE{"Layer 3: Decision"}
+        DECIDE -->|"PROCEED"| EXIT_LOOP["✅ Exit Loop"]
+        DECIDE -->|"RETRY<br/>+ strategy adjustment"| LOOP_START
+    end
+
+    %% ===== POST-LOOP =====
+    EXIT_LOOP --> P8
+    subgraph POSTLOOP["Post-Loop — Approved Model Only"]
+        P8["PHASE 8: Scenario Simulation<br/>11+ what-if scenarios<br/>On approved model only<br/>(not wasted on rejected models)"]
+        P8 --> P9
+        P9["PHASE 9: AI Narratives (GPT-4.1)<br/>5 sections with agent context:<br/>• Iterations & quality progression<br/>• Strategy changes & adjustments<br/>• EDA findings & convergence<br/>• VIF & multicollinearity context"]
+    end
+
+    %% ===== OUTPUTS =====
+    P9 --> OUTPUTS
+    subgraph OUTPUTS["📦 Final Outputs"]
+        PLOTS["13 PNG visualizations<br/>outputs/plots/"]
+        REPORT["Narrative report (MD)<br/>outputs/reports/"]
+        TRACE["Agent reasoning trace (TXT)<br/>Timestamped decision log"]
+    end
+
+    %% ===== CHANNEL GROUPS =====
+    subgraph GROUPS["Channel Groups (EDA-Validated)"]
+        direction LR
+        G1["traditional<br/>TV + Sponsorship<br/>GMV: +0.75"]
+        G2["digital_performance<br/>Online.mkt + Affiliates<br/>GMV: +0.88"]
+        G3["digital_brand<br/>Digital + Content.Mkt + SEM<br/>GMV: +0.51 (negative marginal)"]
+        G4["other<br/>Radio + Other<br/>GMV: +0.21 (individually negative)"]
+    end
+
+    %% ===== SPECS =====
+    subgraph SPECS["10 Model Specifications"]
+        direction LR
+        BASE["Base A-F (3 features)<br/>A: 2 groups + sale<br/>B: Total invest + sale + NPS<br/>C: Top 2 channels + sale<br/>D: Digital perf + sale + lag<br/>E: Total invest + discount + sale<br/>F: Total invest + sale_days + NPS"]
+        WEEKLY["Weekly G-J (6-8 features)<br/>G: 3 groups + sale + discount + NPS<br/>H: 3 groups + sale + lag + NPS<br/>I: 4 groups + sale + discount + lag<br/>J: 4 groups + all controls (8 feats)"]
+    end
+
+    %% ===== STYLING =====
+    classDef phase fill:#4361ee,stroke:#3451de,color:#fff
+    classDef data fill:#0891b2,stroke:#0780a0,color:#fff
+    classDef decision fill:#ef4444,stroke:#dc2626,color:#fff
+    classDef output fill:#7c3aed,stroke:#6d30d0,color:#fff
+    classDef config fill:#475569,stroke:#374151,color:#fff
+    classDef postloop fill:#16a34a,stroke:#15803d,color:#fff
+
+    class P1,P2,P3,P4,FEAT1,FEAT2,FEAT3,MODEL,EVAL phase
+    class HARD,LLM data
+    class DECIDE,LOOP_START,COMPARE decision
+    class PLOTS,REPORT,TRACE output
+    class CONFIG config
+    class P8,P9,EXIT_LOOP postloop
+    class MAIN,REAGG phase
