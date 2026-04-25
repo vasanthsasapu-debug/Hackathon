@@ -19,6 +19,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# # Generated outputs (reproducible by running pipeline)
-# outputs/plots/
-# outputs/reports/
+# Generated outputs (reproducible by running pipeline)
+outputs/plots/
+outputs/reports/
+outputs/
