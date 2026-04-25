@@ -26,18 +26,20 @@ import sys
 import json
 import time
 import traceback
+import pandas as pd
 
 src_dir = os.path.dirname(os.path.abspath(__file__))
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from config import get_paths, get_llm_api_key, LLM_CONFIG, MODEL_SETTINGS, PipelineSummary, logger
+from config import get_paths, get_llm_api_key, LLM_CONFIG, PipelineSummary, logger
 from eda_pipeline import load_all_data, run_full_eda
 from outlier_detection import run_outlier_pipeline
 from data_aggregation import build_modeling_dataset
 from feature_engineering import run_feature_engineering
 from modeling_engine import run_modeling_pipeline
 from narrative_generator import NarrativeGenerator, generate_all_narratives, call_llm, get_llm_client
+from response_curves import ResponseCurveAnalyzer, run_response_curve_analysis
 
 
 # =============================================================================
@@ -50,10 +52,12 @@ class AgentState:
     Every decision, result, and reasoning trace is recorded here.
     """
 
-    def __init__(self, granularity="weekly", top_n_scenarios=1, model_filter="all"):
+    def __init__(self, granularity="weekly", top_n_scenarios=1, model_filter="all",
+                 skip_narratives=False):
         self.granularity = granularity
         self.top_n_scenarios = top_n_scenarios
         self.model_filter = model_filter
+        self.skip_narratives = skip_narratives
 
         # Pipeline outputs
         self.data = None
@@ -65,6 +69,8 @@ class AgentState:
         self.fe_result = None
         self.model_result = None
         self.narrator = None
+        self.response_curves = None
+        self.all_ranked_models = []
 
         # Agent tracking
         self.current_phase = "init"
@@ -127,13 +133,13 @@ class QualityEvaluator:
     Uses both rule-based checks and LLM reasoning.
     """
 
-    # Thresholds — single source of truth in MODEL_SETTINGS["quality_thresholds"] (config.py)
-    _QT = MODEL_SETTINGS["quality_thresholds"]
-    MIN_R2 = _QT["min_r2"]
-    MIN_ADJ_R2 = _QT["min_adj_r2"]
-    MAX_VIF = _QT["max_vif"]
-    MIN_MODELS_PASSED = _QT["min_models_passed"]
-    MIN_ORDINALITY_RATE = _QT["min_ordinality_rate"]
+    # Thresholds — aligned with LLM acceptance criteria
+    # Weekly R² >= 0.50 is the bar for acceptable; below triggers RETRY
+    MIN_R2 = 0.50
+    MIN_ADJ_R2 = 0.45
+    MAX_VIF = 50
+    MIN_MODELS_PASSED = 5
+    MIN_ORDINALITY_RATE = 0.5
 
     def __init__(self, llm_client=None):
         self.client = llm_client
@@ -365,8 +371,8 @@ Decide if this model is good enough for business use GIVEN THE DATA CONSTRAINTS.
 DATA CONSTRAINTS:
 - This is a POC with only 12 months of data (Jul 2015 - Jun 2016)
 - Weekly: 47 data points. Monthly: 10-11 data points. Sample size is LIMITED.
-- With small samples, R-squared of 0.50-0.60 is realistic and acceptable for weekly.
-  Do NOT expect R² > 0.60 from 47 weekly data points with marketing data.
+- With small samples, R-squared of 0.70-0.80 is realistic and acceptable for weekly.
+  Do NOT expect R² > 0.80 from 47 weekly data points with marketing data.
 - For monthly models, R² >= 0.70 is acceptable given fewer but cleaner data points.
 
 EDA FINDINGS (data-driven, not assumptions):
@@ -500,18 +506,44 @@ def tool_run_outliers(state):
 
 
 def tool_run_aggregation(state):
-    """Aggregate data to requested granularity."""
+    """Aggregate data to requested granularity. Caches weekly dataset to avoid recomputing."""
     state.current_phase = "aggregation"
     try:
+        cache_path = os.path.join(state.paths["output_dir"], f"cached_{state.granularity}_dataset.csv")
+
+        if os.path.exists(cache_path):
+            # Load cached dataset
+            cached_df = pd.read_csv(cache_path, parse_dates=["Date"] if "Date" in pd.read_csv(cache_path, nrows=1).columns else None)
+            updated = state.clean_data.copy()
+            updated["monthly"] = cached_df
+            state.aggregated_data = updated
+            n = len(cached_df)
+            state.add_reasoning("aggregation",
+                               f"Loaded cached {state.granularity} dataset ({n} periods) from {cache_path}.",
+                               "PROCEED",
+                               {"n_periods": n, "granularity": state.granularity, "cached": True})
+            print(f"  [CACHE HIT] Loaded {n} periods from {cache_path}")
+            return True
+
+        # Build fresh
         result = build_modeling_dataset(state.clean_data, granularity=state.granularity)
         if result is None:
             raise ValueError("Aggregation returned None")
         state.aggregated_data = result["data"]
         n = result["n_periods"]
+
+        # Save cache
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            result["data"]["monthly"].to_csv(cache_path, index=False)
+            print(f"  [CACHE SAVE] Saved {state.granularity} dataset to {cache_path}")
+        except Exception as ce:
+            logger.warning("  Cache save failed: %s", ce)
+
         state.add_reasoning("aggregation",
                            f"{state.granularity} aggregation: {n} periods.",
                            "PROCEED",
-                           {"n_periods": n, "granularity": state.granularity})
+                           {"n_periods": n, "granularity": state.granularity, "cached": False})
         return True
     except Exception as e:
         state.add_reasoning("aggregation", f"Failed: {e}", "STOP")
@@ -541,9 +573,11 @@ def tool_run_features(state):
 
         # Apply spec filtering based on agent strategy
         BASE_SPECS = {"spec_A_grouped_channels", "spec_B_total_spend", "spec_C_top_channels",
-                      "spec_D_with_momentum", "spec_E_discount_effect", "spec_F_sale_duration"}
+                      "spec_D_with_momentum", "spec_E_discount_effect", "spec_F_sale_duration",
+                      "spec_K_all_channels"}
         WEEKLY_SPECS = {"spec_G_groups_with_discount", "spec_H_groups_with_momentum",
-                        "spec_I_all_groups_full", "spec_J_groups_max_controls"}
+                        "spec_I_all_groups_full", "spec_J_groups_max_controls",
+                        "spec_K_all_channels"}
         GROUP_SPECS = {"spec_A_grouped_channels", "spec_J_groups_max_controls"}
 
         if strategy == "base":
@@ -601,6 +635,7 @@ def tool_run_modeling(state, skip_scenarios=True):
             raise ValueError("Modeling returned None")
         best = state.model_result["best_model"]
         r2 = best["train_result"]["r_squared"]
+        state.all_ranked_models.extend(state.model_result["ranked_models"])
         state.add_reasoning("modeling",
                            f"Best model: {best['spec_name']} ({best['model_type']}) R2={r2:.3f}",
                            "EVALUATE",
@@ -672,6 +707,10 @@ def tool_run_narratives(state):
             ],
         }
 
+        # Inject response curve context if available
+        if state.response_curves and state.response_curves.get("narrative_context"):
+            agent_context["response_curve_context"] = state.response_curves["narrative_context"]
+
         state.narrator = generate_all_narratives(
             {"modeling": state.model_result, "feature_engineering": state.fe_result},
             outlier_log=state.outlier_log,
@@ -679,11 +718,48 @@ def tool_run_narratives(state):
             corr_matrix=state.corr_matrix,
             agent_context=agent_context,
         )
+
         state.add_reasoning("narratives", "Narratives generated with agent context.", "PROCEED")
         return True
     except Exception as e:
         state.add_reasoning("narratives", f"Failed: {e}", "PROCEED_WITHOUT",
                            {"note": "Narratives are non-critical"})
+        return True
+
+
+def tool_run_response_curves(state):
+    """Run response curve & ROI analysis on the approved model (post-loop)."""
+    state.current_phase = "response_curves"
+    try:
+        mr = dict(state.model_result)
+        if state.all_ranked_models:
+            mr["ranked_models"] = state.all_ranked_models
+        rc_result = run_response_curve_analysis(
+            model_result=mr,
+            feature_matrix=state.fe_result["data"],
+            clean_data=state.aggregated_data,
+            save_dir=state.paths["plots_dir"],
+        )
+
+        # Store on state for narratives and UI
+        state.response_curves = rc_result
+        state.model_result["response_curves"] = rc_result
+
+        n_channels = len(rc_result.get("channel_curves", {}))
+        n_groups = len(rc_result.get("group_curves", {}))
+        recs = rc_result.get("roi_summary", {}).get("recommendations", [])
+
+        state.add_reasoning("response_curves",
+                           f"Response curves computed for {n_channels} channels, "
+                           f"{n_groups} groups. {len(recs)} optimization recommendations.",
+                           "PROCEED",
+                           {"n_channels": n_channels, "n_groups": n_groups,
+                            "recommendations": recs[:3]})
+        return True
+    except Exception as e:
+        state.add_reasoning("response_curves", f"Failed: {e}", "PROCEED_WITHOUT",
+                           {"note": "Response curves are non-critical"})
+        state.response_curves = None
         return True
 
 
@@ -790,6 +866,7 @@ def evaluate_and_decide(state, evaluator):
 
 def run_agentic_pipeline(granularity="weekly", top_n_scenarios=1,
                          model_filter="all", skip_eda=False,
+                         skip_narratives=False,
                          data_dir=None, output_dir=None):
     """
     Run the MMIX pipeline with agentic decision-making.
@@ -816,6 +893,7 @@ def run_agentic_pipeline(granularity="weekly", top_n_scenarios=1,
         top_n_scenarios: models for scenarios
         model_filter:    'all', 'linear', or comma-separated
         skip_eda:        skip EDA
+        skip_narratives: skip AI narrative generation
         data_dir:        data folder override
         output_dir:      output folder override
 
@@ -825,7 +903,7 @@ def run_agentic_pipeline(granularity="weekly", top_n_scenarios=1,
     start_time = time.time()
 
     # Initialize
-    state = AgentState(granularity, top_n_scenarios, model_filter)
+    state = AgentState(granularity, top_n_scenarios, model_filter, skip_narratives)
     if data_dir or output_dir:
         state.paths = get_paths(data_dir, output_dir)
 
@@ -986,12 +1064,26 @@ def run_agentic_pipeline(granularity="weekly", top_n_scenarios=1,
     tool_run_scenarios(state)
 
     # =====================================================================
-    # PHASE 9: Narratives (with full agent context)
+    # PHASE 8.5: Response Curves & ROI Analysis
     # =====================================================================
     print("\n" + "=" * 70)
-    print("[PHASE 9] NARRATIVES (with agent context)")
+    print("[PHASE 8.5] RESPONSE CURVES & ROI OPTIMIZATION")
     print("=" * 70)
-    tool_run_narratives(state)
+    tool_run_response_curves(state)
+
+    # =====================================================================
+    # PHASE 9: Narratives (with full agent context)
+    # =====================================================================
+    if state.skip_narratives:
+        print("\n" + "=" * 70)
+        print("[PHASE 9] NARRATIVES (SKIPPED by user)")
+        print("=" * 70)
+        state.add_reasoning("narratives", "Skipped by user request (--skip-narratives)", "SKIP")
+    else:
+        print("\n" + "=" * 70)
+        print("[PHASE 9] NARRATIVES (with agent context)")
+        print("=" * 70)
+        tool_run_narratives(state)
 
     # =====================================================================
     # FINAL SUMMARY

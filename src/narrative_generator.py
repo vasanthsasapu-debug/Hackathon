@@ -33,7 +33,7 @@ def get_llm_client():
 
     key = get_llm_api_key()
     if not key:
-        logger.error("API key not found. Set AZURE_OPENAI_API_KEY in .env")
+        logger.error("API key not found. Set %s in .env", LLM_CONFIG["api_key_env"])
         return None
 
     try:
@@ -296,6 +296,11 @@ AGENT ITERATION HISTORY:
   adjusted its feature selection strategy to improve results.
 """
 
+            # Always include response curve analysis if available
+            rc_context = agent_context.get("response_curve_context")
+            if rc_context:
+                agent_context_text += f"\n{rc_context}\n"
+
         prompt = f"""Interpret these Marketing Mix Model results for a business audience.
 
 BEST MODEL:
@@ -328,31 +333,49 @@ Write a business interpretation covering:
         self.narratives["modeling"] = narrative
         return narrative
 
-    def narrate_scenarios(self, scenario_results):
-        """
-        Generate narrative for scenario simulation results.
-
-        Args:
-            scenario_results: list of scenario result dicts
-        """
+    def narrate_scenarios(self, scenario_results, response_curve_context=None):
+        """Generate narrative grounded in ROI data, not just scenario percentages."""
         scen_text = "\n".join(
             f"  {s['scenario_name']}: {s['change_pct']:+.1f}% GMV change "
             f"(Baseline: {s['baseline_gmv']/1e7:.2f} Cr -> {s['predicted_gmv']/1e7:.2f} Cr)"
             for s in scenario_results
         )
 
-        prompt = f"""Translate these marketing budget scenario simulations into 
+        if response_curve_context:
+            prompt = f"""You are writing budget recommendations for a marketing director.
+
+PRIMARY DATA — USE THIS FOR ALL RECOMMENDATIONS:
+{response_curve_context}
+
+SUPPORTING DATA — scenario simulations:
+{scen_text}
+
+CRITICAL INSTRUCTION: Base every recommendation on the marginal ROI numbers and
+optimal spend points above. Do NOT just say "+20% in channel X gives Y% GMV lift".
+Instead say "Channel X returns ₹Z per ₹1 at current spend, with optimal spend at
+N× current level" and recommend specific ₹ reallocation amounts.
+
+Write recommendations covering:
+1. Overall media ROI — total return on media investment
+2. Per-channel ROI ranking — which channels to increase/decrease with specific ₹ marginal returns
+3. Optimal spend levels — where each channel sits vs its saturation point
+4. Budget reallocation — specific shifts with expected ₹ impact
+5. Sale events vs media spend — which lever is stronger (use scenario data here)
+6. Recommended strategy with ₹ amounts
+7. Caveats (per-channel estimates are directional if from secondary model)"""
+        else:
+            prompt = f"""Translate these marketing budget scenario simulations into
 actionable recommendations for a marketing director.
 
 SCENARIO RESULTS:
 {scen_text}
 
 Write specific recommendations covering:
-1. Which single channel increase gives the best return
-2. Whether budget reallocation (shifting between channels) is worth it
-3. The impact of sale events vs media spend -- which lever is stronger
-4. A recommended budget strategy based on these findings
-5. Risks of the recommended strategy"""
+1. Which channels to increase/decrease
+2. Budget reallocation opportunities
+3. Sale events vs media spend
+4. Recommended strategy
+5. Risks"""
 
         narrative = call_llm(self.client, prompt)
         self.narratives["scenarios"] = narrative
@@ -603,7 +626,8 @@ def generate_all_narratives(pipeline_result, outlier_log=None, assumptions=None,
     try:
         scenarios = modeling.get("scenarios", []) if modeling else []
         if scenarios:
-            narrator.narrate_scenarios(scenarios)
+            rc_context = agent_context.get("response_curve_context") if agent_context else None
+            narrator.narrate_scenarios(scenarios, response_curve_context=rc_context)
             print("  [OK] Scenario narrative generated")
     except Exception as e:
         logger.error("  Scenario narrative failed: %s", e)
